@@ -1,0 +1,2930 @@
+#!/usr/bin/env python
+"""
+AWS Security Report Generator
+
+A comprehensive AWS cloud security reporting solution that centralizes and normalizes
+security findings across multiple AWS accounts and local report repositories.
+"""
+import os
+import sys
+import re
+import json
+import yaml
+import logging
+import logging.handlers
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Set, Tuple, Callable
+from datetime import datetime, timedelta
+import pandas as pd
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.styles.differential import DifferentialStyle
+from openpyxl.formatting.rule import Rule
+from openpyxl.chart import PieChart, Reference, BarChart
+from openpyxl.worksheet.table import Table, TableStyleInfo
+import boto3
+from botocore.exceptions import ClientError, ProfileNotFound
+import questionary
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table as RichTable
+from rich.progress import Progress
+
+# Initialize console for rich output
+console = Console()
+
+# ----------------------------------------------------------------------------
+# Logging Utilities
+# ----------------------------------------------------------------------------
+
+def setup_logging(log_level: str = "INFO", log_to_file: bool = True) -> None:
+    """Set up logging configuration."""
+    # Convert string log level to logging constant
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        numeric_level = logging.INFO
+    
+    # Create logs directory if it doesn't exist
+    if log_to_file:
+        log_dir = Path.cwd() / "logs"
+        log_dir.mkdir(exist_ok=True)
+        
+        # Create log filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"security_reporter_{timestamp}.log"
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(numeric_level)
+    
+    # Remove any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(numeric_level)
+    
+    # Create formatter
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    console_handler.setFormatter(formatter)
+    
+    # Add console handler to root logger
+    root_logger.addHandler(console_handler)
+    
+    # Add file handler if requested
+    if log_to_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(numeric_level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        
+        # Log the log file location
+        logging.info(f"Logging to file: {log_file}")
+
+def set_boto3_logging_level(level: str = "WARNING") -> None:
+    """Set the logging level for boto3 and botocore."""
+    # Convert string log level to logging constant
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        numeric_level = logging.WARNING
+    
+    # Set boto3 and botocore loggers to the specified level
+    logging.getLogger('boto3').setLevel(numeric_level)
+    logging.getLogger('botocore').setLevel(numeric_level)
+    logging.getLogger('urllib3').setLevel(numeric_level)
+    
+    logging.info(f"Set boto3 and botocore logging level to {level}")
+
+class AuditLogger:
+    """Logger for audit trail purposes."""
+    
+    def __init__(self, name: str = "audit") -> None:
+        """Initialize the audit logger."""
+        self.logger = logging.getLogger(f"audit.{name}")
+        
+        # Create audit log directory if it doesn't exist
+        audit_dir = Path.cwd() / "logs" / "audit"
+        audit_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Create audit log file (one per day)
+        date_str = datetime.now().strftime("%Y%m%d")
+        audit_file = audit_dir / f"audit_{date_str}.log"
+        
+        # Create a rotating file handler
+        handler = logging.handlers.RotatingFileHandler(
+            audit_file,
+            maxBytes=10*1024*1024,  # 10 MB
+            backupCount=10
+        )
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        handler.setFormatter(formatter)
+        
+        # Add handler to logger if it doesn't already have one
+        if not self.logger.handlers:
+            self.logger.addHandler(handler)
+        
+        self.logger.setLevel(logging.INFO)
+    
+    def log_authentication(self, user: str, success: bool, method: str, source_ip: Optional[str] = None) -> None:
+        """Log an authentication event."""
+        status = "SUCCESS" if success else "FAILURE"
+        ip_info = f" from {source_ip}" if source_ip else ""
+        
+        self.logger.info(f"AUTHENTICATION - {status} - User: {user} - Method: {method}{ip_info}")
+    
+    def log_api_call(self, service: str, operation: str, parameters: Optional[dict] = None, 
+                    source_ip: Optional[str] = None, account_id: Optional[str] = None) -> None:
+        """Log an API call."""
+        account_info = f" - Account: {account_id}" if account_id else ""
+        ip_info = f" - Source IP: {source_ip}" if source_ip else ""
+        param_info = f" - Parameters: {parameters}" if parameters else ""
+        
+        self.logger.info(f"API_CALL - Service: {service} - Operation: {operation}{account_info}{ip_info}{param_info}")
+    
+    def log_data_access(self, resource_type: str, resource_id: str, operation: str, 
+                       user: Optional[str] = None, account_id: Optional[str] = None) -> None:
+        """Log a data access event."""
+        user_info = f" - User: {user}" if user else ""
+        account_info = f" - Account: {account_id}" if account_id else ""
+        
+        self.logger.info(f"DATA_ACCESS - Resource Type: {resource_type} - Resource ID: {resource_id} - Operation: {operation}{user_info}{account_info}")
+    
+    def log_report_generation(self, report_type: str, output_file: str, 
+                             finding_count: int, account_count: Optional[int] = None) -> None:
+        """Log a report generation event."""
+        account_info = f" - Accounts: {account_count}" if account_count else ""
+        
+        self.logger.info(f"REPORT_GENERATION - Type: {report_type} - Findings: {finding_count}{account_info} - Output: {output_file}")
+
+# ----------------------------------------------------------------------------
+# Configuration Management
+# ----------------------------------------------------------------------------
+
+# Default configuration values
+DEFAULT_CONFIG = {
+    "aws": {
+        "default_region": "us-east-1",
+        "role_name": "SecurityAuditRole",
+        "findings_limit": 1000,
+        "findings_days": 90
+    },
+    "report": {
+        "default_local_dir": r"C:\User\jgray\OneDrive - DOI\Document\2025 Security Hub Reports",
+        "include_info_findings": True,
+        "max_report_size_mb": 50
+    },
+    "export": {
+        "excel": {
+            "enabled": True,
+            "add_charts": True,
+            "add_pivot_tables": True
+        },
+        "csv": {
+            "enabled": False
+        },
+        "json": {
+            "enabled": False
+        }
+    },
+    "user_preferences": {
+        "last_mode": None,
+        "last_directories": []
+    }
+}
+
+def get_config_dir() -> Path:
+    """Get the configuration directory."""
+    # Use the user's home directory
+    home = Path.home()
+    config_dir = home / ".aws-security-reporter"
+    
+    # Create directory if it doesn't exist
+    if not config_dir.exists():
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created configuration directory: {config_dir}")
+        except Exception as e:
+            logging.warning(f"Could not create configuration directory {config_dir}: {str(e)}")
+            # Fall back to current directory
+            config_dir = Path.cwd() / "config"
+            config_dir.mkdir(exist_ok=True)
+    
+    return config_dir
+
+def get_config_path() -> Path:
+    """Get the configuration file path."""
+    config_dir = get_config_dir()
+    return config_dir / "config.yaml"
+
+def load_config() -> Dict[str, Any]:
+    """Load configuration from file, creating default if it doesn't exist."""
+    config_path = get_config_path()
+    
+    # If config file doesn't exist, create it with defaults
+    if not config_path.exists():
+        try:
+            # Create parent directory if it doesn't exist
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write default config
+            with open(config_path, 'w') as f:
+                yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
+            
+            logging.info(f"Created default configuration at {config_path}")
+            
+            return DEFAULT_CONFIG
+        except Exception as e:
+            logging.error(f"Error creating default configuration: {str(e)}")
+            return DEFAULT_CONFIG
+    
+    # Load existing config
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        logging.info(f"Loaded configuration from {config_path}")
+        
+        # Merge with defaults to ensure all keys exist
+        merged_config = merge_configs(DEFAULT_CONFIG, config)
+        
+        return merged_config
+    except Exception as e:
+        logging.error(f"Error loading configuration from {config_path}: {str(e)}")
+        return DEFAULT_CONFIG
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """Save configuration to file."""
+    config_path = get_config_path()
+    
+    try:
+        # Create parent directory if it doesn't exist
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write config
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        
+        logging.info(f"Saved configuration to {config_path}")
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error saving configuration to {config_path}: {str(e)}")
+        return False
+
+def merge_configs(default_config: Dict[str, Any], user_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge user config with default config, keeping all default keys."""
+    merged = default_config.copy()
+    
+    def merge_dict(target, source):
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                merge_dict(target[key], value)
+            else:
+                target[key] = value
+    
+    # Make sure user_config is a dictionary
+    if user_config and isinstance(user_config, dict):
+        merge_dict(merged, user_config)
+    
+    return merged
+
+def save_user_preferences(preferences: Dict[str, Any]) -> bool:
+    """Save user preferences to configuration."""
+    try:
+        config = load_config()
+        
+        # Update user preferences
+        if 'user_preferences' not in config:
+            config['user_preferences'] = {}
+        
+        for key, value in preferences.items():
+            config['user_preferences'][key] = value
+        
+        # Save updated config
+        return save_config(config)
+    except Exception as e:
+        logging.error(f"Error saving user preferences: {str(e)}")
+        return False
+
+def get_user_preferences() -> Dict[str, Any]:
+    """Get user preferences from configuration."""
+    try:
+        config = load_config()
+        return config.get('user_preferences', {})
+    except Exception as e:
+        logging.error(f"Error getting user preferences: {str(e)}")
+        return {}
+
+def update_config_value(key_path: str, value: Any) -> bool:
+    """Update a specific configuration value using a dot-separated path."""
+    try:
+        config = load_config()
+        
+        keys = key_path.split('.')
+        target = config
+        
+        # Navigate to the parent of the target key
+        for key in keys[:-1]:
+            if key not in target:
+                target[key] = {}
+            target = target[key]
+        
+        # Set the value
+        target[keys[-1]] = value
+        
+        # Save updated config
+        return save_config(config)
+    except Exception as e:
+        logging.error(f"Error updating configuration value for {key_path}: {str(e)}")
+        return False
+
+# ----------------------------------------------------------------------------
+# AWS Authentication
+# ----------------------------------------------------------------------------
+
+def get_boto3_session(credentials: Dict[str, Any]) -> boto3.Session:
+    """Create a boto3 session using the provided credentials."""
+    try:
+        if "profile_name" in credentials:
+            logging.info(f"Creating session using profile: {credentials['profile_name']}")
+            session = boto3.Session(
+                profile_name=credentials["profile_name"],
+                region_name=credentials.get("region", "us-east-1")
+            )
+        else:
+            logging.info("Creating session using explicit credentials")
+            session = boto3.Session(
+                aws_access_key_id=credentials["access_key"],
+                aws_secret_access_key=credentials["secret_key"],
+                region_name=credentials.get("region", "us-east-1")
+            )
+        
+        return session
+    
+    except ProfileNotFound:
+        error_msg = f"AWS profile '{credentials.get('profile_name')}' not found"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except KeyError as e:
+        error_msg = f"Missing required credential: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"Error creating AWS session: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def validate_aws_access(credentials: Dict[str, Any]) -> bool:
+    """Validate AWS access using the provided credentials."""
+    try:
+        session = get_boto3_session(credentials)
+        
+        # Try to get caller identity to validate credentials
+        sts = session.client('sts')
+        identity = sts.get_caller_identity()
+        
+        logging.info(f"Successfully validated AWS access for: {identity['Arn']}")
+        
+        # Store account ID in credentials if not already there
+        if "account_id" not in credentials:
+            credentials["account_id"] = identity["Account"]
+        
+        return True
+    
+    except ClientError as e:
+        error_msg = f"AWS access validation failed: {e.response['Error']['Message']}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"AWS access validation failed: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def assume_role(session: boto3.Session, account_id: str, role_name: str) -> Dict[str, Any]:
+    """Assume a role in another AWS account."""
+    try:
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        role_session_name = f"SecurityReporter-{account_id}"
+        
+        logging.info(f"Attempting to assume role: {role_arn}")
+        
+        sts = session.client('sts')
+        response = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=role_session_name,
+            DurationSeconds=3600  # 1 hour
+        )
+        
+        logging.info(f"Successfully assumed role: {role_arn}")
+        
+        return {
+            "aws_access_key_id": response["Credentials"]["AccessKeyId"],
+            "aws_secret_access_key": response["Credentials"]["SecretAccessKey"],
+            "aws_session_token": response["Credentials"]["SessionToken"]
+        }
+    
+    except ClientError as e:
+        error_msg = f"Failed to assume role {role_name} in account {account_id}: {e.response['Error']['Message']}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"Failed to assume role {role_name} in account {account_id}: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def get_assumed_session(session: boto3.Session, account_id: str, role_name: str, region: Optional[str] = None) -> boto3.Session:
+    """Get a boto3 session for an assumed role."""
+    temp_credentials = assume_role(session, account_id, role_name)
+    
+    return boto3.Session(
+        aws_access_key_id=temp_credentials["aws_access_key_id"],
+        aws_secret_access_key=temp_credentials["aws_secret_access_key"],
+        aws_session_token=temp_credentials["aws_session_token"],
+        region_name=region
+    )
+
+# ----------------------------------------------------------------------------
+# AWS Organizations
+# ----------------------------------------------------------------------------
+
+def get_organization_accounts(credentials: Dict[str, Any]) -> List[str]:
+    """Get list of all accounts in the AWS Organization."""
+    try:
+        session = get_boto3_session(credentials)
+        org_client = session.client('organizations')
+        
+        logging.info("Retrieving accounts from AWS Organizations")
+        
+        accounts = []
+        paginator = org_client.get_paginator('list_accounts')
+        
+        # Handle pagination
+        for page in paginator.paginate():
+            for account in page['Accounts']:
+                if account['Status'] == 'ACTIVE':
+                    accounts.append(account['Id'])
+        
+        logging.info(f"Found {len(accounts)} active accounts in the organization")
+        
+        # Add current account if not already in the list
+        if credentials.get("account_id") not in accounts:
+            accounts.append(credentials.get("account_id"))
+        
+        return accounts
+    
+    except ClientError as e:
+        # Check if it's a permissions issue
+        if e.response['Error']['Code'] == 'AccessDeniedException':
+            logging.warning("No access to AWS Organizations. Falling back to single account mode.")
+            return [credentials.get("account_id")]
+        
+        error_msg = f"Failed to retrieve accounts from AWS Organizations: {e.response['Error']['Message']}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"Error retrieving AWS organization accounts: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def get_organization_structure(credentials: Dict[str, Any]) -> Dict[str, Any]:
+    """Get hierarchical structure of the AWS Organization."""
+    try:
+        session = get_boto3_session(credentials)
+        org_client = session.client('organizations')
+        
+        # Get the root ID
+        roots = org_client.list_roots()['Roots']
+        if not roots:
+            raise ValueError("No organization root found")
+        
+        root_id = roots[0]['Id']
+        
+        # Build organization structure
+        org_structure = {
+            'id': root_id,
+            'name': 'Root',
+            'type': 'ROOT',
+            'children': _get_children(org_client, root_id)
+        }
+        
+        return org_structure
+    
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'AccessDeniedException':
+            logging.warning("No access to AWS Organizations structure")
+            return {"id": "unknown", "name": "Unknown", "type": "UNKNOWN", "children": []}
+        
+        error_msg = f"Failed to retrieve organization structure: {e.response['Error']['Message']}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"Error retrieving AWS organization structure: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def _get_children(org_client, parent_id: str) -> List[Dict[str, Any]]:
+    """Recursively get children of an organization unit."""
+    children = []
+    
+    # Get organizational units
+    paginator = org_client.get_paginator('list_organizational_units_for_parent')
+    for page in paginator.paginate(ParentId=parent_id):
+        for ou in page['OrganizationalUnits']:
+            child = {
+                'id': ou['Id'],
+                'name': ou['Name'],
+                'type': 'ORGANIZATIONAL_UNIT',
+                'children': _get_children(org_client, ou['Id'])
+            }
+            children.append(child)
+    
+    # Get accounts
+    paginator = org_client.get_paginator('list_accounts_for_parent')
+    for page in paginator.paginate(ParentId=parent_id):
+        for account in page['Accounts']:
+            if account['Status'] == 'ACTIVE':
+                child = {
+                    'id': account['Id'],
+                    'name': account['Name'],
+                    'email': account['Email'],
+                    'type': 'ACCOUNT',
+                    'children': []
+                }
+                children.append(child)
+    
+    return children
+
+def filter_accounts_by_tags(credentials: Dict[str, Any], accounts: List[str], tags: Dict[str, str]) -> List[str]:
+    """Filter accounts by tags."""
+    try:
+        session = get_boto3_session(credentials)
+        org_client = session.client('organizations')
+        
+        filtered_accounts = []
+        
+        for account_id in accounts:
+            try:
+                response = org_client.list_tags_for_resource(
+                    ResourceId=account_id
+                )
+                
+                account_tags = {tag['Key']: tag['Value'] for tag in response.get('Tags', [])}
+                
+                # Check if all required tags match
+                matches_all = True
+                for key, value in tags.items():
+                    if key not in account_tags or account_tags[key] != value:
+                        matches_all = False
+                        break
+                
+                if matches_all:
+                    filtered_accounts.append(account_id)
+                    
+            except ClientError:
+                logging.warning(f"Could not retrieve tags for account {account_id}")
+        
+        return filtered_accounts
+        
+    except Exception as e:
+        logging.error(f"Error filtering accounts by tags: {str(e)}")
+        # Return original accounts list as fallback
+        return accounts
+
+# ----------------------------------------------------------------------------
+# AWS Security Hub
+# ----------------------------------------------------------------------------
+
+def get_security_hub_findings(credentials: Dict[str, Any], account_id: str) -> List[Dict[str, Any]]:
+    """Retrieve security findings from AWS Security Hub for the specified account."""
+    try:
+        # Create session (with role assumption if needed)
+        if credentials.get("account_id") != account_id and "role_name" in credentials:
+            # Need to assume role in target account
+            main_session = get_boto3_session(credentials)
+            session = get_assumed_session(
+                main_session, 
+                account_id, 
+                credentials["role_name"],
+                credentials.get("region")
+            )
+        else:
+            # Use the main account's credentials
+            session = get_boto3_session(credentials)
+        
+        # Create Security Hub client
+        securityhub = session.client('securityhub')
+        
+        logging.info(f"Retrieving Security Hub findings for account {account_id}")
+        
+        # Get findings from the last 90 days
+        start_time = datetime.utcnow() - timedelta(days=90)
+        
+        filters = {
+            'RecordState': [{'Value': 'ACTIVE', 'Comparison': 'EQUALS'}],
+            'UpdatedAt': [
+                {
+                    'Start': start_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'End': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+            ]
+        }
+        
+        findings = []
+        
+        # Use pagination to retrieve all findings
+        paginator = securityhub.get_paginator('get_findings')
+        page_iterator = paginator.paginate(Filters=filters)
+        
+        for page in page_iterator:
+            findings.extend(page['Findings'])
+        
+        logging.info(f"Retrieved {len(findings)} findings from Security Hub for account {account_id}")
+        
+        return findings
+    
+    except ClientError as e:
+        error_msg = f"Failed to retrieve Security Hub findings for account {account_id}: {e.response['Error']['Message']}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
+    except Exception as e:
+        error_msg = f"Error retrieving Security Hub findings: {str(e)}"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+def get_enabled_standards(credentials: Dict[str, Any], account_id: str) -> List[Dict[str, Any]]:
+    """Get enabled security standards in Security Hub."""
+    try:
+        # Create session (with role assumption if needed)
+        if credentials.get("account_id") != account_id and "role_name" in credentials:
+            # Need to assume role in target account
+            main_session = get_boto3_session(credentials)
+            session = get_assumed_session(
+                main_session, 
+                account_id, 
+                credentials["role_name"],
+                credentials.get("region")
+            )
+        else:
+            # Use the main account's credentials
+            session = get_boto3_session(credentials)
+        
+        # Create Security Hub client
+        securityhub = session.client('securityhub')
+        
+        # Get enabled standards
+        standards = []
+        paginator = securityhub.get_paginator('get_enabled_standards')
+        
+        for page in paginator.paginate():
+            standards.extend(page['StandardsSubscriptions'])
+        
+        return standards
+    
+    except Exception as e:
+        logging.error(f"Error retrieving enabled standards: {str(e)}")
+        return []
+
+def get_security_hub_status(credentials: Dict[str, Any], account_id: str) -> Dict[str, Any]:
+    """Get the Security Hub status for an account."""
+    try:
+        # Create session (with role assumption if needed)
+        if credentials.get("account_id") != account_id and "role_name" in credentials:
+            # Need to assume role in target account
+            main_session = get_boto3_session(credentials)
+            session = get_assumed_session(
+                main_session, 
+                account_id, 
+                credentials["role_name"],
+                credentials.get("region")
+            )
+        else:
+            # Use the main account's credentials
+            session = get_boto3_session(credentials)
+        
+        # Create Security Hub client
+        securityhub = session.client('securityhub')
+        
+        # Get Security Hub status
+        response = securityhub.get_enabled_standards()
+        
+        # Check if any standards are enabled
+        standards_enabled = len(response['StandardsSubscriptions']) > 0
+        
+        # Get administrator account if present
+        try:
+            admin_response = securityhub.get_administrator_account()
+            admin_account = admin_response.get('Administrator', {}).get('AccountId')
+        except:
+            admin_account = None
+        
+        return {
+            'enabled': True,
+            'standards_enabled': standards_enabled,
+            'administrator_account': admin_account
+        }
+    
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            # Security Hub is not enabled
+            return {
+                'enabled': False,
+                'standards_enabled': False,
+                'administrator_account': None
+            }
+        
+        logging.error(f"Error retrieving Security Hub status: {str(e)}")
+        
+        # Default response if we can't determine status
+        return {
+            'enabled': False,
+            'standards_enabled': False,
+            'administrator_account': None,
+            'error': str(e)
+        }
+
+# ----------------------------------------------------------------------------
+# Security Hub Parser
+# ----------------------------------------------------------------------------
+
+def parse_security_hub_findings(findings: List[Dict[str, Any]], account_id: str) -> List[Dict[str, Any]]:
+    """Parse and normalize Security Hub findings."""
+    normalized_findings = []
+    
+    logging.info(f"Normalizing {len(findings)} Security Hub findings for account {account_id}")
+    
+    for finding in findings:
+        try:
+            normalized = normalize_security_hub_finding(finding, account_id)
+            normalized_findings.append(normalized)
+        except Exception as e:
+            logging.error(f"Error normalizing finding: {str(e)}")
+            # Include a minimal normalized version
+            try:
+                normalized = {
+                    'id': finding.get('Id', 'unknown'),
+                    'source': 'aws-security-hub',
+                    'account_id': account_id,
+                    'title': finding.get('Title', 'Unknown finding'),
+                    'description': finding.get('Description', 'No description available'),
+                    'severity': 'UNKNOWN',
+                    'resource_type': 'Unknown',
+                    'resource_id': 'Unknown',
+                    'status': 'UNKNOWN',
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat(),
+                    'raw_finding': finding
+                }
+                normalized_findings.append(normalized)
+            except:
+                logging.error(f"Failed to create minimal normalized finding")
+    
+    logging.info(f"Successfully normalized {len(normalized_findings)} findings")
+    
+    return normalized_findings
+
+def normalize_security_hub_finding(finding: Dict[str, Any], account_id: str) -> Dict[str, Any]:
+    """Normalize a single Security Hub finding."""
+    # Extract resource details
+    resources = finding.get('Resources', [])
+    resource_type = resources[0].get('Type', 'Unknown') if resources else 'Unknown'
+    resource_id = resources[0].get('Id', 'Unknown') if resources else 'Unknown'
+    
+    # Map Security Hub severity to standardized severity
+    severity = finding.get('Severity', {}).get('Label', 'INFORMATIONAL')
+    normalized_severity = map_severity(severity)
+    
+    # Extract compliance status
+    compliance_status = finding.get('Compliance', {}).get('Status', 'UNKNOWN')
+    
+    # Extract dates
+    created_at = finding.get('CreatedAt', datetime.utcnow().isoformat())
+    updated_at = finding.get('UpdatedAt', datetime.utcnow().isoformat())
+    
+    # Create normalized finding
+    normalized = {
+        'id': finding.get('Id', 'unknown'),
+        'source': 'aws-security-hub',
+        'account_id': account_id,
+        'title': finding.get('Title', 'Unknown finding'),
+        'description': finding.get('Description', 'No description available'),
+        'severity': normalized_severity,
+        'resource_type': resource_type,
+        'resource_id': resource_id,
+        'status': compliance_status,
+        'created_at': created_at,
+        'updated_at': updated_at,
+        'remediation': extract_remediation(finding),
+        'standard': extract_standard_details(finding),
+        'region': finding.get('Region', 'unknown'),
+        'raw_finding': finding  # Store the original finding for reference
+    }
+    
+    return normalized
+
+def map_severity(severity: str) -> str:
+    """Map Security Hub severity to standardized severity."""
+    severity_mapping = {
+        'CRITICAL': 'CRITICAL',
+        'HIGH': 'HIGH',
+        'MEDIUM': 'MEDIUM',
+        'LOW': 'LOW',
+        'INFORMATIONAL': 'INFO'
+    }
+    
+    return severity_mapping.get(severity, 'UNKNOWN')
+
+def extract_remediation(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract remediation details from a finding."""
+    remediation = {
+        'recommendation': 'No specific remediation available',
+        'url': None
+    }
+    
+    # Check for remediation section
+    if 'Remediation' in finding:
+        rec = finding['Remediation']
+        if 'Recommendation' in rec:
+            if 'Text' in rec['Recommendation']:
+                remediation['recommendation'] = rec['Recommendation']['Text']
+            if 'Url' in rec['Recommendation']:
+                remediation['url'] = rec['Recommendation']['Url']
+    
+    # Some findings have remediation in ProductFields
+    product_fields = finding.get('ProductFields', {})
+    if 'RecommendationUrl' in product_fields:
+        remediation['url'] = product_fields['RecommendationUrl']
+    
+    return remediation
+
+def extract_standard_details(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract compliance standard details from a finding."""
+    product_fields = finding.get('ProductFields', {})
+    
+    # Initialize standard details
+    standard = {
+        'name': 'Unknown',
+        'control_id': 'Unknown',
+        'related_requirements': []
+    }
+    
+    # Extract standard name and control ID based on provider
+    if 'aws/securityhub/ProductName' in product_fields:
+        provider = product_fields['aws/securityhub/ProductName']
+        
+        if provider == 'Security Hub':
+            # This is a Security Hub standard finding
+            if 'aws/securityhub/RuleId' in product_fields:
+                rule_id = product_fields['aws/securityhub/RuleId']
+                
+                if rule_id.startswith('arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark'):
+                    standard['name'] = 'CIS AWS Foundations Benchmark'
+                    # Extract control ID from the ARN
+                    parts = rule_id.split('/')
+                    if len(parts) > 2:
+                        control_parts = parts[-1].split('.')
+                        if len(control_parts) > 0:
+                            standard['control_id'] = control_parts[-1]
+                
+                elif 'pci-dss' in rule_id:
+                    standard['name'] = 'PCI DSS'
+                    # Extract control ID
+                    parts = rule_id.split('/')
+                    if len(parts) > 2:
+                        standard['control_id'] = parts[-1]
+                
+                elif 'aws-foundational-security-best-practices' in rule_id:
+                    standard['name'] = 'AWS Foundational Security Best Practices'
+                    # Extract control ID
+                    parts = rule_id.split('/')
+                    if len(parts) > 2:
+                        standard['control_id'] = parts[-1]
+    
+    # Extract related requirements
+    if 'RelatedRequirements' in finding.get('Compliance', {}):
+        standard['related_requirements'] = finding['Compliance']['RelatedRequirements']
+    
+    return standard
+
+def parse_security_hub_json_file(file_path: str, account_id: str) -> List[Dict[str, Any]]:
+    """Parse a Security Hub findings JSON file."""
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        # Handle different potential JSON structures
+        if isinstance(data, list):
+            # Direct list of findings
+            raw_findings = data
+        elif 'Findings' in data:
+            # Security Hub API response format
+            raw_findings = data['Findings']
+        elif 'findings' in data:
+            # Lowercase key version
+            raw_findings = data['findings']
+        else:
+            # Try to find a findings list somewhere in the data
+            raw_findings = []
+            for key, value in data.items():
+                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                    # This might be a findings list
+                    if 'Id' in value[0] or 'id' in value[0]:
+                        raw_findings = value
+                        break
+        
+        return parse_security_hub_findings(raw_findings, account_id)
+    
+    except Exception as e:
+        logging.error(f"Error parsing Security Hub JSON file {file_path}: {str(e)}")
+        return []
+
+# ----------------------------------------------------------------------------
+# Excel Report Parser
+# ----------------------------------------------------------------------------
+
+def parse_excel_reports(directory: Path) -> List[Dict[str, Any]]:
+    """Parse all Excel reports in the given directory."""
+    findings = []
+    
+    if not directory.exists():
+        logging.warning(f"Directory does not exist: {directory}")
+        return findings
+    
+    logging.info(f"Parsing Excel reports in directory: {directory}")
+    
+    excel_files = list(directory.glob("**/*.xlsx")) + list(directory.glob("**/*.xls"))
+    
+    if not excel_files:
+        logging.info(f"No Excel files found in directory: {directory}")
+        return findings
+    
+    logging.info(f"Found {len(excel_files)} Excel files")
+    
+    for file_path in excel_files:
+        try:
+            report_type = detect_report_type(file_path)
+            
+            if report_type == "security_hub":
+                file_findings = parse_security_hub_excel(file_path)
+            elif report_type == "inspector":
+                file_findings = parse_inspector_excel(file_path)
+            elif report_type == "trusted_advisor":
+                file_findings = parse_trusted_advisor_excel(file_path)
+            elif report_type == "config":
+                file_findings = parse_config_excel(file_path)
+            else:
+                file_findings = parse_generic_excel(file_path)
+            
+            findings.extend(file_findings)
+            logging.info(f"Parsed {len(file_findings)} findings from {file_path}")
+            
+        except Exception as e:
+            logging.error(f"Error parsing Excel file {file_path}: {str(e)}")
+    
+    return findings
+
+def detect_report_type(file_path: Path) -> str:
+    """Detect the type of security report based on filename and content."""
+    file_name = file_path.name.lower()
+    
+    # Check filename patterns first
+    if "securityhub" in file_name or "security_hub" in file_name or "security-hub" in file_name:
+        return "security_hub"
+    elif "inspector" in file_name:
+        return "inspector"
+    elif "trustedadvisor" in file_name or "trusted_advisor" in file_name or "trusted-advisor" in file_name:
+        return "trusted_advisor"
+    elif "config" in file_name or "aws-config" in file_name or "aws_config" in file_name:
+        return "config"
+    
+    # If filename doesn't give us enough information, examine the content
+    try:
+        # Load the workbook to check sheet names and headers
+        wb = openpyxl.load_workbook(file_path, read_only=True)
+        
+        # Check sheet names
+        sheet_names = wb.sheetnames
+        for sheet_name in sheet_names:
+            sheet_name_lower = sheet_name.lower()
+            if "security hub" in sheet_name_lower or "securityhub" in sheet_name_lower:
+                return "security_hub"
+            elif "inspector" in sheet_name_lower:
+                return "inspector"
+            elif "trusted advisor" in sheet_name_lower or "trustedadvisor" in sheet_name_lower:
+                return "trusted_advisor"
+            elif "config" in sheet_name_lower:
+                return "config"
+        
+        # Check headers in the first sheet
+        sheet = wb[sheet_names[0]]
+        headers = []
+        for cell in next(sheet.iter_rows(min_row=1, max_row=1)):
+            if cell.value:
+                headers.append(str(cell.value).lower())
+        
+        if headers:
+            if any("finding" in h for h in headers) and any("severity" in h for h in headers):
+                if any("security hub" in h for h in headers):
+                    return "security_hub"
+                elif any("inspector" in h for h in headers):
+                    return "inspector"
+            elif any("resource" in h for h in headers) and any("compliance" in h for h in headers):
+                return "config"
+            elif any("category" in h for h in headers) and any("check" in h for h in headers):
+                return "trusted_advisor"
+    
+    except Exception as e:
+        logging.warning(f"Error detecting report type for {file_path}: {str(e)}")
+    
+    # Default to generic if we can't determine type
+    return "generic"
+
+def parse_security_hub_excel(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse a Security Hub Excel report."""
+    try:
+        # Extract account ID from filename if possible
+        account_id = extract_account_id_from_filename(file_path)
+        
+        # Load the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Handle different possible column naming conventions
+        rename_map = {
+            'Finding ID': 'id',
+            'FindingID': 'id',
+            'Finding Id': 'id',
+            'Title': 'title',
+            'Description': 'description',
+            'Severity': 'severity',
+            'Resource Type': 'resource_type',
+            'ResourceType': 'resource_type',
+            'Resource ID': 'resource_id',
+            'ResourceId': 'resource_id',
+            'Resource Id': 'resource_id',
+            'Status': 'status',
+            'Compliance Status': 'status',
+            'ComplianceStatus': 'status',
+            'Created At': 'created_at',
+            'CreatedAt': 'created_at',
+            'Updated At': 'updated_at',
+            'UpdatedAt': 'updated_at',
+            'AWS Account': 'account_id',
+            'Account ID': 'account_id',
+            'AccountId': 'account_id',
+            'Account Id': 'account_id',
+            'AWS Region': 'region',
+            'Region': 'region',
+            'Standard': 'standard_name',
+            'Control ID': 'control_id',
+            'ControlId': 'control_id',
+            'Control Id': 'control_id',
+            'Remediation': 'remediation',
+            'Recommendation': 'remediation'
+        }
+        
+        # Rename columns if they exist
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Fill in account ID if missing and we extracted it
+        if 'account_id' not in df.columns and account_id:
+            df['account_id'] = account_id
+        elif 'account_id' not in df.columns:
+            df['account_id'] = 'unknown'
+        
+        # Normalize severity values
+        if 'severity' in df.columns:
+            df['severity'] = df['severity'].apply(map_severity)
+        else:
+            df['severity'] = 'UNKNOWN'
+        
+        # Convert to list of dictionaries
+        findings = df.to_dict('records')
+        
+        # Add source and normalize
+        normalized_findings = []
+        for finding in findings:
+            normalized = {
+                'id': finding.get('id', f"excel-{hash(str(finding))}"),
+                'source': 'excel-security-hub',
+                'account_id': finding.get('account_id', 'unknown'),
+                'title': finding.get('title', 'Unknown finding'),
+                'description': finding.get('description', 'No description available'),
+                'severity': finding.get('severity', 'UNKNOWN'),
+                'resource_type': finding.get('resource_type', 'Unknown'),
+                'resource_id': finding.get('resource_id', 'Unknown'),
+                'status': finding.get('status', 'UNKNOWN'),
+                'created_at': finding.get('created_at', datetime.utcnow().isoformat()),
+                'updated_at': finding.get('updated_at', datetime.utcnow().isoformat()),
+                'region': finding.get('region', 'unknown'),
+                'remediation': {
+                    'recommendation': finding.get('remediation', 'No specific remediation available'),
+                    'url': None
+                },
+                'standard': {
+                    'name': finding.get('standard_name', 'Unknown'),
+                    'control_id': finding.get('control_id', 'Unknown'),
+                    'related_requirements': []
+                },
+                'raw_finding': finding
+            }
+            normalized_findings.append(normalized)
+        
+        return normalized_findings
+    
+    except Exception as e:
+        logging.error(f"Error parsing Security Hub Excel file {file_path}: {str(e)}")
+        return []
+
+def parse_inspector_excel(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse an Amazon Inspector Excel report."""
+    try:
+        # Extract account ID from filename if possible
+        account_id = extract_account_id_from_filename(file_path)
+        
+        # Load the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Handle different possible column naming conventions
+        rename_map = {
+            'Finding ARN': 'id',
+            'FindingArn': 'id',
+            'Finding Arn': 'id',
+            'Title': 'title',
+            'Description': 'description',
+            'Severity': 'severity',
+            'Resource Type': 'resource_type',
+            'ResourceType': 'resource_type',
+            'Resource ID': 'resource_id',
+            'ResourceId': 'resource_id',
+            'Resource Id': 'resource_id',
+            'Status': 'status',
+            'Created At': 'created_at',
+            'CreatedAt': 'created_at',
+            'Updated At': 'updated_at',
+            'UpdatedAt': 'updated_at',
+            'AWS Account': 'account_id',
+            'Account ID': 'account_id',
+            'AccountId': 'account_id',
+            'Account Id': 'account_id',
+            'AWS Region': 'region',
+            'Region': 'region',
+            'Remediation': 'remediation',
+            'Recommendation': 'remediation',
+            'CVE': 'cve',
+            'Package Name': 'package_name',
+            'Package Version': 'package_version'
+        }
+        
+        # Rename columns if they exist
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Fill in account ID if missing and we extracted it
+        if 'account_id' not in df.columns and account_id:
+            df['account_id'] = account_id
+        elif 'account_id' not in df.columns:
+            df['account_id'] = 'unknown'
+        
+        # Normalize severity values
+        if 'severity' in df.columns:
+            df['severity'] = df['severity'].apply(map_severity)
+        else:
+            df['severity'] = 'UNKNOWN'
+        
+        # Convert to list of dictionaries
+        findings = df.to_dict('records')
+        
+        # Add source and normalize
+        normalized_findings = []
+        for finding in findings:
+            normalized = {
+                'id': finding.get('id', f"excel-{hash(str(finding))}"),
+                'source': 'excel-inspector',
+                'account_id': finding.get('account_id', 'unknown'),
+                'title': finding.get('title', 'Unknown finding'),
+                'description': finding.get('description', 'No description available'),
+                'severity': finding.get('severity', 'UNKNOWN'),
+                'resource_type': finding.get('resource_type', 'Unknown'),
+                'resource_id': finding.get('resource_id', 'Unknown'),
+                'status': finding.get('status', 'UNKNOWN'),
+                'created_at': finding.get('created_at', datetime.utcnow().isoformat()),
+                'updated_at': finding.get('updated_at', datetime.utcnow().isoformat()),
+                'region': finding.get('region', 'unknown'),
+                'remediation': {
+                    'recommendation': finding.get('remediation', 'No specific remediation available'),
+                    'url': None
+                },
+                'standard': {
+                    'name': 'Inspector',
+                    'control_id': finding.get('cve', 'Unknown'),
+                    'related_requirements': []
+                },
+                'raw_finding': finding
+            }
+            normalized_findings.append(normalized)
+        
+        return normalized_findings
+    
+    except Exception as e:
+        logging.error(f"Error parsing Inspector Excel file {file_path}: {str(e)}")
+        return []
+
+def parse_trusted_advisor_excel(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse a Trusted Advisor Excel report."""
+    try:
+        # Extract account ID from filename if possible
+        account_id = extract_account_id_from_filename(file_path)
+        
+        # Load the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Handle different possible column naming conventions
+        rename_map = {
+            'Check ID': 'id',
+            'CheckId': 'id',
+            'Check Id': 'id',
+            'Check Name': 'title',
+            'CheckName': 'title',
+            'Description': 'description',
+            'Category': 'category',
+            'Status': 'status',
+            'Resource ID': 'resource_id',
+            'ResourceId': 'resource_id',
+            'Resource Id': 'resource_id',
+            'Region': 'region',
+            'Recommendation': 'remediation'
+        }
+        
+        # Rename columns if they exist
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Fill in account ID if missing and we extracted it
+        if 'account_id' not in df.columns and account_id:
+            df['account_id'] = account_id
+        elif 'account_id' not in df.columns:
+            df['account_id'] = 'unknown'
+        
+        # Map status to severity
+        if 'status' in df.columns:
+            df['severity'] = df['status'].apply(map_trusted_advisor_status_to_severity)
+        else:
+            df['severity'] = 'UNKNOWN'
+        
+        # Convert to list of dictionaries
+        findings = df.to_dict('records')
+        
+        # Add source and normalize
+        normalized_findings = []
+        for finding in findings:
+            # Skip "ok" status findings
+            if finding.get('status', '').lower() == 'ok':
+                continue
+                
+            normalized = {
+                'id': finding.get('id', f"excel-{hash(str(finding))}"),
+                'source': 'excel-trusted-advisor',
+                'account_id': finding.get('account_id', 'unknown'),
+                'title': finding.get('title', 'Unknown finding'),
+                'description': finding.get('description', 'No description available'),
+                'severity': finding.get('severity', 'UNKNOWN'),
+                'resource_type': finding.get('category', 'Unknown'),
+                'resource_id': finding.get('resource_id', 'Unknown'),
+                'status': finding.get('status', 'UNKNOWN'),
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+                'region': finding.get('region', 'unknown'),
+                'remediation': {
+                    'recommendation': finding.get('remediation', 'No specific remediation available'),
+                    'url': None
+                },
+                'standard': {
+                    'name': 'AWS Trusted Advisor',
+                    'control_id': finding.get('id', 'Unknown'),
+                    'related_requirements': []
+                },
+                'raw_finding': finding
+            }
+            normalized_findings.append(normalized)
+        
+        return normalized_findings
+    
+    except Exception as e:
+        logging.error(f"Error parsing Trusted Advisor Excel file {file_path}: {str(e)}")
+        return []
+
+def parse_config_excel(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse an AWS Config Excel report."""
+    try:
+        # Extract account ID from filename if possible
+        account_id = extract_account_id_from_filename(file_path)
+        
+        # Load the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Handle different possible column naming conventions
+        rename_map = {
+            'Resource ID': 'resource_id',
+            'ResourceId': 'resource_id',
+            'Resource Id': 'resource_id',
+            'Resource Type': 'resource_type',
+            'ResourceType': 'resource_type',
+            'Rule Name': 'title',
+            'RuleName': 'title',
+            'Compliance': 'status',
+            'Compliance Status': 'status',
+            'ComplianceStatus': 'status',
+            'Region': 'region',
+            'Last Updated': 'updated_at',
+            'LastUpdated': 'updated_at',
+            'Account ID': 'account_id',
+            'AccountId': 'account_id',
+            'Account Id': 'account_id'
+        }
+        
+        # Rename columns if they exist
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Fill in account ID if missing and we extracted it
+        if 'account_id' not in df.columns and account_id:
+            df['account_id'] = account_id
+        elif 'account_id' not in df.columns:
+            df['account_id'] = 'unknown'
+        
+        # Add description if missing
+        if 'description' not in df.columns:
+            df['description'] = df['title'].apply(lambda x: f"Config rule violation: {x}")
+        
+        # Map compliance status to severity
+        if 'status' in df.columns:
+            df['severity'] = df['status'].apply(map_config_status_to_severity)
+        else:
+            df['severity'] = 'UNKNOWN'
+        
+        # Convert to list of dictionaries
+        findings = df.to_dict('records')
+        
+        # Add source and normalize
+        normalized_findings = []
+        for finding in findings:
+            # Skip compliant findings
+            if finding.get('status', '').lower() == 'compliant':
+                continue
+                
+            normalized = {
+                'id': f"config-{finding.get('resource_id', '')}-{finding.get('title', '')}",
+                'source': 'excel-config',
+                'account_id': finding.get('account_id', 'unknown'),
+                'title': finding.get('title', 'Unknown finding'),
+                'description': finding.get('description', 'No description available'),
+                'severity': finding.get('severity', 'UNKNOWN'),
+                'resource_type': finding.get('resource_type', 'Unknown'),
+                'resource_id': finding.get('resource_id', 'Unknown'),
+                'status': finding.get('status', 'UNKNOWN'),
+                'created_at': finding.get('updated_at', datetime.utcnow().isoformat()),
+                'updated_at': finding.get('updated_at', datetime.utcnow().isoformat()),
+                'region': finding.get('region', 'unknown'),
+                'remediation': {
+                    'recommendation': 'Review and update resource configuration to comply with the rule',
+                    'url': None
+                },
+                'standard': {
+                    'name': 'AWS Config',
+                    'control_id': finding.get('title', 'Unknown'),
+                    'related_requirements': []
+                },
+                'raw_finding': finding
+            }
+            normalized_findings.append(normalized)
+        
+        return normalized_findings
+    
+    except Exception as e:
+        logging.error(f"Error parsing Config Excel file {file_path}: {str(e)}")
+        return []
+
+def parse_generic_excel(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse a generic security findings Excel report."""
+    try:
+        # Extract account ID from filename if possible
+        account_id = extract_account_id_from_filename(file_path)
+        
+        # Load the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Try to identify key columns based on common naming patterns
+        key_columns = {
+            'id': ['id', 'finding id', 'finding_id', 'findingid', 'arn', 'finding arn'],
+            'title': ['title', 'name', 'finding', 'finding name', 'check name'],
+            'description': ['description', 'desc', 'details', 'finding details'],
+            'severity': ['severity', 'criticality', 'importance', 'priority'],
+            'resource_type': ['resource type', 'resourcetype', 'resource_type', 'asset type'],
+            'resource_id': ['resource id', 'resourceid', 'resource_id', 'asset id', 'asset'],
+            'status': ['status', 'state', 'compliance', 'compliance status'],
+            'account_id': ['account id', 'accountid', 'account_id', 'aws account', 'aws account id'],
+            'region': ['region', 'aws region']
+        }
+        
+        # Create a mapping of actual column names to standardized names
+        column_mapping = {}
+        for std_col, possible_names in key_columns.items():
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if col_lower in possible_names:
+                    column_mapping[col] = std_col
+                    break
+        
+        # Rename columns if mapping found
+        if column_mapping:
+            df = df.rename(columns=column_mapping)
+        
+        # Fill in account ID if missing and we extracted it
+        if 'account_id' not in df.columns and account_id:
+            df['account_id'] = account_id
+        elif 'account_id' not in df.columns:
+            df['account_id'] = 'unknown'
+        
+        # Normalize severity values if present
+        if 'severity' in df.columns:
+            df['severity'] = df['severity'].apply(map_severity)
+        else:
+            df['severity'] = 'UNKNOWN'
+        
+        # Convert to list of dictionaries
+        findings = df.to_dict('records')
+        
+        # Add source and normalize
+        normalized_findings = []
+        for finding in findings:
+            normalized = {
+                'id': finding.get('id', f"excel-{hash(str(finding))}"),
+                'source': 'excel-generic',
+                'account_id': finding.get('account_id', 'unknown'),
+                'title': finding.get('title', 'Unknown finding'),
+                'description': finding.get('description', 'No description available'),
+                'severity': finding.get('severity', 'UNKNOWN'),
+                'resource_type': finding.get('resource_type', 'Unknown'),
+                'resource_id': finding.get('resource_id', 'Unknown'),
+                'status': finding.get('status', 'UNKNOWN'),
+                'created_at': finding.get('created_at', datetime.utcnow().isoformat()),
+                'updated_at': finding.get('updated_at', datetime.utcnow().isoformat()),
+                'region': finding.get('region', 'unknown'),
+                'remediation': {
+                    'recommendation': finding.get('remediation', 'No specific remediation available'),
+                    'url': None
+                },
+                'standard': {
+                    'name': 'Unknown',
+                    'control_id': 'Unknown',
+                    'related_requirements': []
+                },
+                'raw_finding': finding
+            }
+            normalized_findings.append(normalized)
+        
+        return normalized_findings
+    
+    except Exception as e:
+        logging.error(f"Error parsing generic Excel file {file_path}: {str(e)}")
+        return []
+
+def extract_account_id_from_filename(file_path: Path) -> Optional[str]:
+    """Extract AWS account ID from the filename if present."""
+    filename = file_path.stem
+    
+    # Look for 12-digit account ID in the filename
+    account_match = re.search(r'(\d{12})', filename)
+    if account_match:
+        return account_match.group(1)
+    
+    return None
+
+def map_trusted_advisor_status_to_severity(status: str) -> str:
+    """Map Trusted Advisor status to standardized severity."""
+    if not status or pd.isna(status):
+        return 'UNKNOWN'
+    
+    status_str = str(status).upper()
+    
+    if status_str in ['ERROR', 'RED']:
+        return 'HIGH'
+    elif status_str in ['WARNING', 'YELLOW']:
+        return 'MEDIUM'
+    elif status_str in ['OK', 'GREEN']:
+        return 'INFO'
+    else:
+        return 'UNKNOWN'
+
+def map_config_status_to_severity(status: str) -> str:
+    """Map AWS Config compliance status to standardized severity."""
+    if not status or pd.isna(status):
+        return 'UNKNOWN'
+    
+    status_str = str(status).upper()
+    
+    if status_str == 'NON_COMPLIANT':
+        return 'HIGH'
+    elif status_str == 'COMPLIANT':
+        return 'INFO'
+    else:
+        return 'UNKNOWN'
+
+# ----------------------------------------------------------------------------
+# Report Merger
+# ----------------------------------------------------------------------------
+
+def merge_security_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge and deduplicate security findings from multiple sources."""
+    logging.info(f"Merging {len(findings)} findings")
+    
+    # Group findings by a composite key for deduplication
+    grouped_findings: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for finding in findings:
+        # Create a deduplication key based on relevant attributes
+        dedup_key = create_deduplication_key(finding)
+        
+        if dedup_key in grouped_findings:
+            grouped_findings[dedup_key].append(finding)
+        else:
+            grouped_findings[dedup_key] = [finding]
+    
+    logging.info(f"Grouped into {len(grouped_findings)} unique findings")
+    
+    # Merge findings within each group
+    merged_findings = []
+    
+    for dedup_key, group in grouped_findings.items():
+        if len(group) == 1:
+            # Single finding, no need to merge
+            merged_findings.append(group[0])
+        else:
+            # Multiple findings, need to merge
+            merged_finding = merge_finding_group(group)
+            merged_findings.append(merged_finding)
+    
+    # Sort by severity and then title
+    severity_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4, 'UNKNOWN': 5}
+    
+    merged_findings.sort(
+        key=lambda x: (
+            severity_order.get(x['severity'], 999),  # Sort by severity
+            x['title']  # Then by title
+        )
+    )
+    
+    logging.info(f"Merged into {len(merged_findings)} findings")
+    
+    return merged_findings
+
+def create_deduplication_key(finding: Dict[str, Any]) -> str:
+    """Create a deduplication key for a finding."""
+    # Use a combination of attributes that would identify the same underlying issue
+    components = [
+        finding.get('account_id', 'unknown'),
+        finding.get('resource_type', 'unknown'),
+        finding.get('resource_id', 'unknown'),
+        finding.get('title', 'unknown')
+    ]
+    
+    # Add region if available
+    if 'region' in finding and finding['region'] != 'unknown':
+        components.append(finding['region'])
+    
+    # Add standard information if available
+    standard = finding.get('standard', {})
+    if standard.get('name') != 'Unknown' and standard.get('control_id') != 'Unknown':
+        components.append(f"{standard['name']}:{standard['control_id']}")
+    
+    # Join components and create a key
+    return '|'.join(components)
+
+def merge_finding_group(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge a group of duplicate findings into a single finding."""
+    # Start with the first finding as a base
+    base_finding = findings[0]
+    
+    # Initialize merged finding with base values
+    merged = {
+        'id': base_finding['id'],
+        'source': f"merged ({', '.join(set(f['source'] for f in findings))})",
+        'account_id': base_finding['account_id'],
+        'title': base_finding['title'],
+        'description': base_finding['description'],
+        'severity': get_highest_severity([f['severity'] for f in findings]),
+        'resource_type': base_finding['resource_type'],
+        'resource_id': base_finding['resource_id'],
+        'status': base_finding['status'],
+        'created_at': get_earliest_date([f.get('created_at') for f in findings]),
+        'updated_at': get_latest_date([f.get('updated_at') for f in findings]),
+        'region': base_finding.get('region', 'unknown'),
+        'remediation': {
+            'recommendation': get_best_remediation([f.get('remediation', {}).get('recommendation') for f in findings]),
+            'url': next((f.get('remediation', {}).get('url') for f in findings if f.get('remediation', {}).get('url')), None)
+        },
+        'standard': {
+            'name': base_finding.get('standard', {}).get('name', 'Unknown'),
+            'control_id': base_finding.get('standard', {}).get('control_id', 'Unknown'),
+            'related_requirements': list(set([req for f in findings for req in f.get('standard', {}).get('related_requirements', [])]))
+        },
+        'duplicate_count': len(findings),
+        'source_findings': [f['id'] for f in findings],
+        'raw_finding': base_finding.get('raw_finding', {})
+    }
+    
+    return merged
+
+def get_highest_severity(severities: List[str]) -> str:
+    """Get the highest severity from a list of severities."""
+    severity_order = {
+        'CRITICAL': 0,
+        'HIGH': 1,
+        'MEDIUM': 2,
+        'LOW': 3,
+        'INFO': 4,
+        'UNKNOWN': 5
+    }
+    
+    # Filter out None values
+    valid_severities = [s for s in severities if s]
+    
+    if not valid_severities:
+        return 'UNKNOWN'
+    
+    # Return the highest severity
+    return min(valid_severities, key=lambda s: severity_order.get(s, 999))
+
+def get_earliest_date(dates: List[str]) -> str:
+    """Get the earliest date from a list of ISO format date strings."""
+    valid_dates = []
+    
+    for date_str in dates:
+        if date_str:
+            try:
+                dt = parse_iso_date(date_str)
+                if dt:
+                    valid_dates.append((dt, date_str))
+            except Exception:
+                pass
+    
+    if not valid_dates:
+        return datetime.utcnow().isoformat()
+    
+    # Return the earliest date string
+    return min(valid_dates, key=lambda x: x[0])[1]
+
+def get_latest_date(dates: List[str]) -> str:
+    """Get the latest date from a list of ISO format date strings."""
+    valid_dates = []
+    
+    for date_str in dates:
+        if date_str:
+            try:
+                dt = parse_iso_date(date_str)
+                if dt:
+                    valid_dates.append((dt, date_str))
+            except Exception:
+                pass
+    
+    if not valid_dates:
+        return datetime.utcnow().isoformat()
+    
+    # Return the latest date string
+    return max(valid_dates, key=lambda x: x[0])[1]
+
+def parse_iso_date(date_str: str) -> datetime:
+    """Parse an ISO format date string."""
+    try:
+        # Try parsing with microseconds
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except ValueError:
+        try:
+            # Try parsing without microseconds
+            return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S')
+        except ValueError:
+            # Try parsing with just the date
+            return datetime.strptime(date_str, '%Y-%m-%d')
+
+def get_best_remediation(recommendations: List[str]) -> str:
+    """Get the best remediation recommendation from a list."""
+    # Filter out None and empty values
+    valid_recommendations = [r for r in recommendations if r and r.strip() and r.lower() != 'no specific remediation available']
+    
+    if not valid_recommendations:
+        return 'No specific remediation available'
+    
+    # Return the longest recommendation as it's likely the most detailed
+    return max(valid_recommendations, key=len)
+
+def categorize_findings(findings: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Categorize findings by severity."""
+    categories = {
+        'CRITICAL': [],
+        'HIGH': [],
+        'MEDIUM': [],
+        'LOW': [],
+        'INFO': [],
+        'UNKNOWN': []
+    }
+    
+    for finding in findings:
+        severity = finding.get('severity', 'UNKNOWN')
+        categories[severity].append(finding)
+    
+    return categories
+
+def aggregate_findings_by_resource_type(findings: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """Aggregate findings by resource type and severity."""
+    aggregated = {}
+    
+    for finding in findings:
+        resource_type = finding.get('resource_type', 'Unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if resource_type not in aggregated:
+            aggregated[resource_type] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'TOTAL': 0
+            }
+        
+        aggregated[resource_type][severity] += 1
+        aggregated[resource_type]['TOTAL'] += 1
+    
+    return aggregated
+
+def aggregate_findings_by_account(findings: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """Aggregate findings by AWS account and severity."""
+    aggregated = {}
+    
+    for finding in findings:
+        account_id = finding.get('account_id', 'unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if account_id not in aggregated:
+            aggregated[account_id] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'TOTAL': 0
+            }
+        
+        aggregated[account_id][severity] += 1
+        aggregated[account_id]['TOTAL'] += 1
+    
+    return aggregated
+
+def aggregate_findings_by_standard(findings: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """Aggregate findings by compliance standard and severity."""
+    aggregated = {}
+    
+    for finding in findings:
+        standard_name = finding.get('standard', {}).get('name', 'Unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if standard_name not in aggregated:
+            aggregated[standard_name] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'TOTAL': 0
+            }
+        
+        aggregated[standard_name][severity] += 1
+        aggregated[standard_name]['TOTAL'] += 1
+    
+    return aggregated
+
+# ----------------------------------------------------------------------------
+# Report Formatter
+# ----------------------------------------------------------------------------
+
+def format_findings_for_export(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Format findings for export to Excel."""
+    logging.info("Formatting findings for export")
+    
+    # Extract key fields from findings
+    formatted_findings = []
+    
+    for finding in findings:
+        formatted = {
+            'Severity': finding.get('severity', 'UNKNOWN'),
+            'Title': finding.get('title', 'Unknown finding'),
+            'Resource Type': finding.get('resource_type', 'Unknown'),
+            'Resource ID': finding.get('resource_id', 'Unknown'),
+            'AWS Account': finding.get('account_id', 'unknown'),
+            'Region': finding.get('region', 'unknown'),
+            'Status': finding.get('status', 'UNKNOWN'),
+            'Description': finding.get('description', 'No description available'),
+            'Remediation': finding.get('remediation', {}).get('recommendation', 'No specific remediation available'),
+            'Standard': finding.get('standard', {}).get('name', 'Unknown'),
+            'Control ID': finding.get('standard', {}).get('control_id', 'Unknown'),
+            'Source': finding.get('source', 'unknown'),
+            'Finding ID': finding.get('id', 'unknown'),
+            'Created': finding.get('created_at', ''),
+            'Updated': finding.get('updated_at', '')
+        }
+        
+        # Add related requirements if available
+        related_requirements = finding.get('standard', {}).get('related_requirements', [])
+        if related_requirements:
+            formatted['Related Requirements'] = ', '.join(related_requirements)
+        
+        # Add duplicate count if available
+        if 'duplicate_count' in finding and finding['duplicate_count'] > 1:
+            formatted['Duplicate Count'] = finding['duplicate_count']
+        
+        formatted_findings.append(formatted)
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(formatted_findings)
+    
+    # Sort by severity and title
+    severity_order = {
+        'CRITICAL': 0,
+        'HIGH': 1,
+        'MEDIUM': 2,
+        'LOW': 3,
+        'INFO': 4,
+        'UNKNOWN': 5
+    }
+    
+    df['SeveritySort'] = df['Severity'].map(severity_order)
+    df = df.sort_values(['SeveritySort', 'Title']).drop('SeveritySort', axis=1)
+    
+    return df
+
+def format_severity_summary(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a summary of findings by severity."""
+    # Count findings by severity
+    severity_counts = {
+        'CRITICAL': 0,
+        'HIGH': 0,
+        'MEDIUM': 0,
+        'LOW': 0,
+        'INFO': 0,
+        'UNKNOWN': 0
+    }
+    
+    for finding in findings:
+        severity = finding.get('severity', 'UNKNOWN')
+        severity_counts[severity] += 1
+    
+    # Convert to DataFrame
+    summary_data = []
+    
+    for severity, count in severity_counts.items():
+        if count > 0:
+            summary_data.append({
+                'Severity': severity,
+                'Count': count,
+                'Percentage': f"{(count / len(findings) * 100):.1f}%" if findings else "0.0%"
+            })
+    
+    df = pd.DataFrame(summary_data)
+    
+    # Sort by severity
+    severity_order = {
+        'CRITICAL': 0,
+        'HIGH': 1,
+        'MEDIUM': 2,
+        'LOW': 3,
+        'INFO': 4,
+        'UNKNOWN': 5
+    }
+    
+    df['SeveritySort'] = df['Severity'].map(severity_order)
+    df = df.sort_values('SeveritySort').drop('SeveritySort', axis=1)
+    
+    return df
+
+def format_resource_type_summary(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a summary of findings by resource type."""
+    # Aggregate findings by resource type and severity
+    resource_summary = {}
+    
+    for finding in findings:
+        resource_type = finding.get('resource_type', 'Unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if resource_type not in resource_summary:
+            resource_summary[resource_type] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'Total': 0
+            }
+        
+        resource_summary[resource_type][severity] += 1
+        resource_summary[resource_type]['Total'] += 1
+    
+    # Convert to DataFrame
+    summary_data = []
+    
+    for resource_type, counts in resource_summary.items():
+        summary_data.append({
+            'Resource Type': resource_type,
+            'Critical': counts['CRITICAL'],
+            'High': counts['HIGH'],
+            'Medium': counts['MEDIUM'],
+            'Low': counts['LOW'],
+            'Info': counts['INFO'],
+            'Unknown': counts['UNKNOWN'],
+            'Total': counts['Total']
+        })
+    
+    df = pd.DataFrame(summary_data)
+    
+    # Sort by total count (descending)
+    df = df.sort_values('Total', ascending=False)
+    
+    return df
+
+def format_account_summary(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a summary of findings by AWS account."""
+    # Aggregate findings by account and severity
+    account_summary = {}
+    
+    for finding in findings:
+        account_id = finding.get('account_id', 'unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if account_id not in account_summary:
+            account_summary[account_id] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'Total': 0
+            }
+        
+        account_summary[account_id][severity] += 1
+        account_summary[account_id]['Total'] += 1
+    
+    # Convert to DataFrame
+    summary_data = []
+    
+    for account_id, counts in account_summary.items():
+        summary_data.append({
+            'AWS Account': account_id,
+            'Critical': counts['CRITICAL'],
+            'High': counts['HIGH'],
+            'Medium': counts['MEDIUM'],
+            'Low': counts['LOW'],
+            'Info': counts['INFO'],
+            'Unknown': counts['UNKNOWN'],
+            'Total': counts['Total']
+        })
+    
+    df = pd.DataFrame(summary_data)
+    
+    # Sort by total count (descending)
+    df = df.sort_values('Total', ascending=False)
+    
+    return df
+
+def format_standard_summary(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a summary of findings by compliance standard."""
+    # Aggregate findings by standard and severity
+    standard_summary = {}
+    
+    for finding in findings:
+        standard_name = finding.get('standard', {}).get('name', 'Unknown')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        if standard_name not in standard_summary:
+            standard_summary[standard_name] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'Total': 0
+            }
+        
+        standard_summary[standard_name][severity] += 1
+        standard_summary[standard_name]['Total'] += 1
+    
+    # Convert to DataFrame
+    summary_data = []
+    
+    for standard_name, counts in standard_summary.items():
+        summary_data.append({
+            'Standard': standard_name,
+            'Critical': counts['CRITICAL'],
+            'High': counts['HIGH'],
+            'Medium': counts['MEDIUM'],
+            'Low': counts['LOW'],
+            'Info': counts['INFO'],
+            'Unknown': counts['UNKNOWN'],
+            'Total': counts['Total']
+        })
+    
+    df = pd.DataFrame(summary_data)
+    
+    # Sort by total count (descending)
+    df = df.sort_values('Total', ascending=False)
+    
+    return df
+
+def format_remediation_summary(findings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a summary of common remediations."""
+    # Aggregate findings by remediation recommendation
+    remediation_summary = {}
+    
+    for finding in findings:
+        remediation = finding.get('remediation', {}).get('recommendation', 'No specific remediation available')
+        severity = finding.get('severity', 'UNKNOWN')
+        
+        # Skip generic "no remediation" entries
+        if remediation.lower() == 'no specific remediation available':
+            continue
+        
+        # Truncate very long remediation text for grouping
+        if len(remediation) > 100:
+            remediation_key = remediation[:100] + "..."
+        else:
+            remediation_key = remediation
+        
+        if remediation_key not in remediation_summary:
+            remediation_summary[remediation_key] = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0,
+                'INFO': 0,
+                'UNKNOWN': 0,
+                'Total': 0,
+                'Full Text': remediation
+            }
+        
+        remediation_summary[remediation_key][severity] += 1
+        remediation_summary[remediation_key]['Total'] += 1
+    
+    # Convert to DataFrame
+    summary_data = []
+    
+    for remediation_key, data in remediation_summary.items():
+        summary_data.append({
+            'Remediation': data['Full Text'],
+            'Critical': data['CRITICAL'],
+            'High': data['HIGH'],
+            'Medium': data['MEDIUM'],
+            'Low': data['LOW'],
+            'Info': data['INFO'],
+            'Unknown': data['UNKNOWN'],
+            'Total': data['Total']
+        })
+    
+    df = pd.DataFrame(summary_data)
+    
+    # Sort by highest severity count, then total
+    df['Priority'] = (
+        df['Critical'] * 10000 +
+        df['High'] * 1000 +
+        df['Medium'] * 100 +
+        df['Low'] * 10 +
+        df['Total']
+    )
+    
+    df = df.sort_values('Priority', ascending=False).drop('Priority', axis=1)
+    
+    return df
+
+def format_executive_summary(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create an executive summary of findings."""
+    # Count findings by severity
+    severity_counts = {
+        'CRITICAL': 0,
+        'HIGH': 0,
+        'MEDIUM': 0,
+        'LOW': 0,
+        'INFO': 0,
+        'UNKNOWN': 0
+    }
+    
+    for finding in findings:
+        severity = finding.get('severity', 'UNKNOWN')
+        severity_counts[severity] += 1
+    
+    # Count unique resources affected
+    unique_resources = set()
+    
+    for finding in findings:
+        resource_id = finding.get('resource_id', 'Unknown')
+        resource_type = finding.get('resource_type', 'Unknown')
+        account_id = finding.get('account_id', 'unknown')
+        
+        # Create a composite key for the resource
+        resource_key = f"{account_id}|{resource_type}|{resource_id}"
+        unique_resources.add(resource_key)
+    
+    # Count unique accounts affected
+    unique_accounts = set(finding.get('account_id', 'unknown') for finding in findings)
+    
+    # Create top 5 critical/high findings
+    top_findings = []
+    
+    # Sort by severity and get top 5 critical/high findings
+    critical_high_findings = [f for f in findings if f.get('severity') in ['CRITICAL', 'HIGH']]
+    sorted_findings = sorted(critical_high_findings, key=lambda x: 0 if x.get('severity') == 'CRITICAL' else 1)
+    
+    for finding in sorted_findings[:5]:
+        top_findings.append({
+            'Severity': finding.get('severity', 'UNKNOWN'),
+            'Title': finding.get('title', 'Unknown finding'),
+            'Resource Type': finding.get('resource_type', 'Unknown'),
+            'Resource ID': finding.get('resource_id', 'Unknown'),
+            'AWS Account': finding.get('account_id', 'unknown')
+        })
+    
+    # Calculate risk score
+    risk_score = calculate_risk_score(severity_counts)
+    
+    return {
+        'total_findings': len(findings),
+        'severity_counts': severity_counts,
+        'unique_resources': len(unique_resources),
+        'unique_accounts': len(unique_accounts),
+        'top_findings': top_findings,
+        'risk_score': risk_score,
+        'report_date': datetime.utcnow().strftime('%Y-%m-%d'),
+        'risk_level': get_risk_level(risk_score)
+    }
+
+def calculate_risk_score(severity_counts: Dict[str, int]) -> float:
+    """Calculate a risk score based on finding severity counts."""
+    # Assign weights to each severity level
+    weights = {
+        'CRITICAL': 10.0,
+        'HIGH': 5.0,
+        'MEDIUM': 2.0,
+        'LOW': 0.5,
+        'INFO': 0.1,
+        'UNKNOWN': 0.25
+    }
+    
+    # Calculate weighted sum
+    weighted_sum = sum(severity_counts[severity] * weights[severity] for severity in severity_counts)
+    
+    # Calculate total possible (if all findings were critical)
+    total_findings = sum(severity_counts.values())
+    max_possible = total_findings * weights['CRITICAL']
+    
+    # Calculate score (0-100)
+    if max_possible > 0:
+        score = min(100.0, (weighted_sum / max_possible) * 100.0)
+    else:
+        score = 0.0
+    
+    return round(score, 1)
+
+def get_risk_level(risk_score: float) -> str:
+    """Get a risk level based on risk score."""
+    if risk_score >= 75.0:
+        return 'CRITICAL'
+    elif risk_score >= 50.0:
+        return 'HIGH'
+    elif risk_score >= 25.0:
+        return 'MEDIUM'
+    elif risk_score >= 5.0:
+        return 'LOW'
+    else:
+        return 'MINIMAL'
+
+# ----------------------------------------------------------------------------
+# Excel Export
+# ----------------------------------------------------------------------------
+
+def generate_excel_report(findings: List[Dict[str, Any]], mode: str) -> str:
+    """Generate an Excel report from the consolidated findings."""
+    # Create report directory if it doesn't exist
+    report_dir = os.path.join(os.getcwd(), 'reports')
+    os.makedirs(report_dir, exist_ok=True)
+    
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"security_report_{mode}_{timestamp}.xlsx"
+    filepath = os.path.join(report_dir, filename)
+    
+    logging.info(f"Generating Excel report: {filepath}")
+    
+    # Create a Pandas Excel writer using openpyxl as the engine
+    writer = pd.ExcelWriter(filepath, engine='openpyxl')
+    
+    # Get various formatted data frames
+    findings_df = format_findings_for_export(findings)
+    severity_summary_df = format_severity_summary(findings)
+    resource_summary_df = format_resource_type_summary(findings)
+    account_summary_df = format_account_summary(findings)
+    standard_summary_df = format_standard_summary(findings)
+    remediation_summary_df = format_remediation_summary(findings)
+    executive_summary = format_executive_summary(findings)
+    
+    # Create sheets
+    create_executive_summary_sheet(writer, executive_summary, mode)
+    
+    # Write DataFrames to Excel
+    findings_df.to_excel(writer, sheet_name='Findings', index=False)
+    severity_summary_df.to_excel(writer, sheet_name='Severity Summary', index=False)
+    resource_summary_df.to_excel(writer, sheet_name='Resource Summary', index=False)
+    account_summary_df.to_excel(writer, sheet_name='Account Summary', index=False)
+    standard_summary_df.to_excel(writer, sheet_name='Standard Summary', index=False)
+    remediation_summary_df.to_excel(writer, sheet_name='Remediation Summary', index=False)
+    
+    # Format sheets
+    workbook = writer.book
+    
+    format_findings_sheet(workbook['Findings'], findings_df)
+    format_summary_sheet(workbook['Severity Summary'], severity_summary_df)
+    format_summary_sheet(workbook['Resource Summary'], resource_summary_df)
+    format_summary_sheet(workbook['Account Summary'], account_summary_df)
+    format_summary_sheet(workbook['Standard Summary'], standard_summary_df)
+    format_summary_sheet(workbook['Remediation Summary'], remediation_summary_df)
+    
+    # Create pivot tables
+    create_pivot_tables(writer, findings_df)
+    
+    # Add charts
+    add_charts(workbook, severity_summary_df, resource_summary_df)
+    
+    # Save the Excel file
+    writer.close()
+    
+    logging.info(f"Excel report generated successfully: {filepath}")
+    
+    return filepath
+
+def create_executive_summary_sheet(writer: pd.ExcelWriter, summary: Dict[str, Any], mode: str) -> None:
+    """Create an executive summary sheet."""
+    # Create a new worksheet
+    workbook = writer.book
+    worksheet = workbook.create_sheet('Executive Summary')
+    
+    # Set column widths
+    worksheet.column_dimensions['A'].width = 20
+    worksheet.column_dimensions['B'].width = 15
+    worksheet.column_dimensions['C'].width = 60
+    
+    # Add title
+    title_cell = worksheet['A1']
+    title_cell.value = f"AWS Security Findings Report - {mode.capitalize()} Mode"
+    title_cell.font = Font(size=16, bold=True)
+    worksheet.merge_cells('A1:C1')
+    
+    # Add report date
+    date_cell = worksheet['A2']
+    date_cell.value = f"Report Date: {summary['report_date']}"
+    date_cell.font = Font(size=12)
+    worksheet.merge_cells('A2:C2')
+    
+    # Add overall risk level
+    risk_level = summary['risk_level']
+    risk_cell = worksheet['A4']
+    risk_cell.value = "Overall Risk Level:"
+    risk_cell.font = Font(bold=True)
+    
+    risk_value_cell = worksheet['B4']
+    risk_value_cell.value = risk_level
+    risk_value_cell.font = Font(bold=True)
+    
+    # Apply color to risk level cell
+    if risk_level == 'CRITICAL':
+        risk_value_cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        risk_value_cell.font = Font(bold=True, color="FFFFFF")
+    elif risk_level == 'HIGH':
+        risk_value_cell.fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+        risk_value_cell.font = Font(bold=True)
+    elif risk_level == 'MEDIUM':
+        risk_value_cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        risk_value_cell.font = Font(bold=True)
+    elif risk_level == 'LOW':
+        risk_value_cell.fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
+        risk_value_cell.font = Font(bold=True)
+    else:  # MINIMAL
+        risk_value_cell.fill = PatternFill(start_color="00B0F0", end_color="00B0F0", fill_type="solid")
+        risk_value_cell.font = Font(bold=True)
+    
+    # Add risk score
+    score_cell = worksheet['A5']
+    score_cell.value = "Risk Score:"
+    score_cell.font = Font(bold=True)
+    
+    score_value_cell = worksheet['B5']
+    score_value_cell.value = f"{summary['risk_score']}/100"
+    
+    # Add summary stats section header
+    stats_header_cell = worksheet['A7']
+    stats_header_cell.value = "Summary Statistics"
+    stats_header_cell.font = Font(size=14, bold=True)
+    worksheet.merge_cells('A7:C7')
+    
+    # Add summary stats
+    worksheet['A9'].value = "Total Findings:"
+    worksheet['B9'].value = summary['total_findings']
+    
+    worksheet['A10'].value = "Critical Findings:"
+    worksheet['B10'].value = summary['severity_counts']['CRITICAL']
+    worksheet['B10'].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    worksheet['B10'].font = Font(color="FFFFFF")
+    
+    worksheet['A11'].value = "High Findings:"
+    worksheet['B11'].value = summary['severity_counts']['HIGH']
+    worksheet['B11'].fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+    
+    worksheet['A12'].value = "Medium Findings:"
+    worksheet['B12'].value = summary['severity_counts']['MEDIUM']
+    worksheet['B12'].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    
+    worksheet['A13'].value = "Low Findings:"
+    worksheet['B13'].value = summary['severity_counts']['LOW']
+    worksheet['B13'].fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
+    
+    worksheet['A14'].value = "Informational Findings:"
+    worksheet['B14'].value = summary['severity_counts']['INFO']
+    worksheet['B14'].fill = PatternFill(start_color="00B0F0", end_color="00B0F0", fill_type="solid")
+    
+    worksheet['A15'].value = "Unknown Severity:"
+    worksheet['B15'].value = summary['severity_counts']['UNKNOWN']
+    worksheet['B15'].fill = PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
+    
+    worksheet['A17'].value = "Unique Resources Affected:"
+    worksheet['B17'].value = summary['unique_resources']
+    
+    worksheet['A18'].value = "Unique AWS Accounts:"
+    worksheet['B18'].value = summary['unique_accounts']
+    
+    # Add top findings section
+    top_header_cell = worksheet['A20']
+    top_header_cell.value = "Top Critical/High Findings"
+    top_header_cell.font = Font(size=14, bold=True)
+    worksheet.merge_cells('A20:C20')
+    
+    # Add top findings headers
+    worksheet['A22'].value = "Severity"
+    worksheet['A22'].font = Font(bold=True)
+    worksheet['B22'].value = "AWS Account"
+    worksheet['B22'].font = Font(bold=True)
+    worksheet['C22'].value = "Finding"
+    worksheet['C22'].font = Font(bold=True)
+    
+    # Add top findings
+    row = 23
+    for finding in summary['top_findings']:
+        worksheet[f'A{row}'].value = finding['Severity']
+        worksheet[f'B{row}'].value = finding['AWS Account']
+        worksheet[f'C{row}'].value = finding['Title']
+        
+        # Apply color to severity cell
+        if finding['Severity'] == 'CRITICAL':
+            worksheet[f'A{row}'].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            worksheet[f'A{row}'].font = Font(color="FFFFFF")
+        elif finding['Severity'] == 'HIGH':
+            worksheet[f'A{row}'].fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+        
+        row += 1
+
+def format_findings_sheet(worksheet, df):
+    """Format the findings worksheet with conditional formatting and styling."""
+    # Adjust column widths
+    for idx, col in enumerate(df.columns):
+        column_letter = openpyxl.utils.get_column_letter(idx + 1)
+        if col in ['Description', 'Remediation']:
+            worksheet.column_dimensions[column_letter].width = 60
+        elif col in ['Resource ID', 'Finding ID']:
+            worksheet.column_dimensions[column_letter].width = 40
+        elif col in ['Title', 'Standard']:
+            worksheet.column_dimensions[column_letter].width = 30
+        else:
+            worksheet.column_dimensions[column_letter].width = 15
+    
+    # Format header row
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        cell.font = Font(bold=True, color="FFFFFF")
+    
+    # Create a table for filtering
+    table_ref = f"A1:{openpyxl.utils.get_column_letter(len(df.columns))}{len(df) + 1}"
+    tab = Table(displayName="FindingsTable", ref=table_ref)
+    
+    # Add a default style
+    style = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False
+    )
+    tab.tableStyleInfo = style
+    
+    # Add the table to the worksheet
+    worksheet.add_table(tab)
+    
+    # Add conditional formatting for severity
+    severity_col_idx = None
+    for idx, col in enumerate(df.columns):
+        if col == 'Severity':
+            severity_col_idx = idx + 1
+            break
+    
+    if severity_col_idx:
+        severity_col_letter = openpyxl.utils.get_column_letter(severity_col_idx)
+        severity_range = f"{severity_col_letter}2:{severity_col_letter}{len(df) + 1}"
+        
+        # CRITICAL - Red
+        critical_rule = Rule(
+            type="containsText",
+            operator="containsText",
+            text="CRITICAL",
+            dxf=DifferentialStyle(
+                fill=PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid"),
+                font=Font(color="FFFFFF")
+            )
+        )
+        worksheet.conditional_formatting.add(severity_range, critical_rule)
+        
+        # HIGH - Orange
+        high_rule = Rule(
+            type="containsText",
+            operator="containsText",
+            text="HIGH",
+            dxf=DifferentialStyle(
+                fill=PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+            )
+        )
+        worksheet.conditional_formatting.add(severity_range, high_rule)
+        
+        # MEDIUM - Yellow
+        medium_rule = Rule(
+            type="containsText",
+            operator="containsText",
+            text="MEDIUM",
+            dxf=DifferentialStyle(
+                fill=PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            )
+        )
+        worksheet.conditional_formatting.add(severity_range, medium_rule)
+        
+        # LOW - Green
+        low_rule = Rule(
+            type="containsText",
+            operator="containsText",
+            text="LOW",
+            dxf=DifferentialStyle(
+                fill=PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
+            )
+        )
+        worksheet.conditional_formatting.add(severity_range, low_rule)
+        
+        # INFO - Blue
+        info_rule = Rule(
+            type="containsText",
+            operator="containsText",
+            text="INFO",
+            dxf=DifferentialStyle(
+                fill=PatternFill(start_color="00B0F0", end_color="00B0F0", fill_type="solid")
+            )
+        )
+        worksheet.conditional_formatting.add(severity_range, info_rule)
+
+def format_summary_sheet(worksheet, df):
+    """Format a summary worksheet with styling and tables."""
+    # Adjust column widths
+    for idx, col in enumerate(df.columns):
+        column_letter = openpyxl.utils.get_column_letter(idx + 1)
+        if col in ['Remediation', 'Description']:
+            worksheet.column_dimensions[column_letter].width = 60
+        elif col in ['Resource Type', 'Standard', 'AWS Account']:
+            worksheet.column_dimensions[column_letter].width = 30
+        else:
+            worksheet.column_dimensions[column_letter].width = 15
+    
+    # Format header row
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        cell.font = Font(bold=True, color="FFFFFF")
+    
+    # Create a Table
+    table_ref = f"A1:{openpyxl.utils.get_column_letter(len(df.columns))}{len(df) + 1}"
+    tab = Table(displayName=f"{worksheet.title.replace(' ', '')}Table", ref=table_ref)
+    
+    # Add a default style
+    style = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False
+    )
+    tab.tableStyleInfo = style
+    
+    # Add the table to the worksheet
+    worksheet.add_table(tab)
+
+def create_pivot_tables(writer, findings_df):
+    """Create pivot tables for interactive analysis."""
+    workbook = writer.book
+    
+    # Create a pivot table showing counts by severity and resource type
+    pivot1_sheet = workbook.create_sheet("Pivot - Severity by Resource")
+    
+    # Create a pivot table showing counts by account and severity
+    pivot2_sheet = workbook.create_sheet("Pivot - Severity by Account")
+    
+    # Note: OpenPyXL's pivot table functionality is limited
+    # Adding instructions for manually creating pivot tables
+    instructions_sheet = workbook.create_sheet("Pivot Instructions")
+    
+    instructions_sheet['A1'].value = "Pivot Table Instructions"
+    instructions_sheet['A1'].font = Font(size=16, bold=True)
+    
+    instructions_sheet['A3'].value = "This workbook contains sheets prepared for pivot tables."
+    instructions_sheet['A4'].value = "To create pivot tables:"
+    instructions_sheet['A5'].value = "1. Select the 'Findings' sheet"
+    instructions_sheet['A6'].value = "2. Select all data (Ctrl+A)"
+    instructions_sheet['A7'].value = "3. From the Insert menu, select PivotTable"
+    instructions_sheet['A8'].value = "4. Create pivot tables with the following configurations:"
+    
+    instructions_sheet['A10'].value = "Pivot 1: Severity by Resource Type"
+    instructions_sheet['A11'].value = "- Rows: Resource Type"
+    instructions_sheet['A12'].value = "- Columns: Severity"
+    instructions_sheet['A13'].value = "- Values: Count of Title"
+    
+    instructions_sheet['A15'].value = "Pivot 2: Severity by Account"
+    instructions_sheet['A16'].value = "- Rows: AWS Account"
+    instructions_sheet['A17'].value = "- Columns: Severity"
+    instructions_sheet['A18'].value = "- Values: Count of Title"
+
+def add_charts(workbook, severity_df, resource_df):
+    """Add charts to visualize the security findings."""
+    # Create charts sheet
+    charts_sheet = workbook.create_sheet("Charts")
+    
+    # Add title
+    title_cell = charts_sheet['A1']
+    title_cell.value = "Security Findings Visualizations"
+    title_cell.font = Font(size=16, bold=True)
+    charts_sheet.merge_cells('A1:H1')
+    
+    # Add chart data directly to the sheet
+    charts_sheet['A3'].value = "Severity"
+    charts_sheet['B3'].value = "Count"
+    
+    row = 4
+    for idx, r in severity_df.iterrows():
+        charts_sheet[f'A{row}'].value = r['Severity']
+        charts_sheet[f'B{row}'].value = r['Count']
+        
+        # Add color to severity cell
+        if r['Severity'] == 'CRITICAL':
+            charts_sheet[f'A{row}'].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            charts_sheet[f'A{row}'].font = Font(color="FFFFFF")
+        elif r['Severity'] == 'HIGH':
+            charts_sheet[f'A{row}'].fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+        elif r['Severity'] == 'MEDIUM':
+            charts_sheet[f'A{row}'].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        elif r['Severity'] == 'LOW':
+            charts_sheet[f'A{row}'].fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
+        elif r['Severity'] == 'INFO':
+            charts_sheet[f'A{row}'].fill = PatternFill(start_color="00B0F0", end_color="00B0F0", fill_type="solid")
+        
+        row += 1
+    
+    # Add chart title
+    charts_sheet['A15'].value = "Chart Instructions:"
+    charts_sheet['A15'].font = Font(bold=True)
+    charts_sheet['A16'].value = "To create a pie chart of findings by severity:"
+    charts_sheet['A17'].value = "1. Select the data range A3:B" + str(row-1)
+    charts_sheet['A18'].value = "2. Insert > Pie Chart"
+    charts_sheet['A19'].value = "3. Format as desired"
+    
+    # Add resource type data for bar chart
+    charts_sheet['D3'].value = "Resource Type"
+    charts_sheet['E3'].value = "Count"
+    
+    row = 4
+    for idx, r in resource_df.head(10).iterrows():
+        charts_sheet[f'D{row}'].value = r['Resource Type']
+        charts_sheet[f'E{row}'].value = r['Total']
+        row += 1
+    
+    # Add chart title
+    charts_sheet['D15'].value = "To create a bar chart of findings by resource type:"
+    charts_sheet['D16'].value = "1. Select the data range D3:E" + str(row-1)
+    charts_sheet['D17'].value = "2. Insert > Bar Chart"
+    charts_sheet['D18'].value = "3. Format as desired"
+
+# ----------------------------------------------------------------------------
+# CLI Interactive Components
+# ----------------------------------------------------------------------------
+
+def get_execution_mode():
+    """Prompt user for execution mode (centralized or targeted)."""
+    console.print(Panel.fit(
+        "[bold]AWS Security Reporter[/bold]\n\n"
+        "This tool will collect and analyze security findings from AWS Security Hub "
+        "and local report repositories.",
+        title="Welcome",
+        border_style="blue"
+    ))
+    
+    mode = questionary.select(
+        "Select execution mode:",
+        choices=[
+            {
+                "name": "Centralized (scan all associated AWS accounts)",
+                "value": "centralized"
+            },
+            {
+                "name": "Targeted (scan a single AWS account)",
+                "value": "targeted"
+            }
+        ],
+        use_indicator=True
+    ).ask()
+    
+    return mode
+
+def get_aws_credentials(mode):
+    """Prompt user for AWS credentials or profile."""
+    use_profile = questionary.confirm(
+        "Do you want to use an AWS profile?",
+        default=True
+    ).ask()
+    
+    credentials = {}
+    
+    if use_profile:
+        profile = questionary.text(
+            "Enter the AWS profile name:",
+            default="default"
+        ).ask()
+        credentials["profile_name"] = profile
+    else:
+        credentials["access_key"] = questionary.text(
+            "Enter AWS Access Key ID:"
+        ).ask()
+        
+        credentials["secret_key"] = questionary.password(
+            "Enter AWS Secret Access Key:"
+        ).ask()
+        
+        if mode == "centralized":
+            credentials["role_name"] = questionary.text(
+                "Enter the IAM role name to assume in target accounts:",
+                default="SecurityAuditRole"
+            ).ask()
+    
+    if mode == "targeted":
+        credentials["account_id"] = questionary.text(
+            "Enter the AWS account ID to scan:"
+        ).ask()
+        
+    credentials["region"] = questionary.text(
+        "Enter the AWS region:",
+        default="us-east-1"
+    ).ask()
+    
+    return credentials
+
+def confirm_local_directories(default_dirs):
+    """Confirm access to default local directories."""
+    accessible_dirs = []
+    
+    for directory in default_dirs:
+        exists = directory.exists()
+        status = "exists" if exists else "not found"
+        
+        console.print(f"Default report directory: [cyan]{directory}[/cyan] - [{'green' if exists else 'red'}]{status}[/]")
+        
+        if not exists:
+            create = questionary.confirm(
+                f"Directory {directory} does not exist. Create it?",
+                default=True
+            ).ask()
+            
+            if create:
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    console.print(f"[green]Created directory: {directory}[/green]")
+                    accessible_dirs.append(directory)
+                except Exception as e:
+                    console.print(f"[red]Error creating directory: {e}[/red]")
+            else:
+                console.print(f"[yellow]Skipping directory: {directory}[/yellow]")
+        else:
+            accessible_dirs.append(directory)
+    
+    return accessible_dirs
+
+def get_additional_directories():
+    """Prompt user for additional directories to scan for reports."""
+    add_dirs = questionary.confirm(
+        "Do you want to include additional directories for report scanning?",
+        default=False
+    ).ask()
+    
+    if not add_dirs:
+        return []
+    
+    additional_dirs = []
+    adding = True
+    
+    common_locations = [
+        r"C:\Reports",
+        r"C:\Users\Public\Documents\Security Reports",
+        r"\\networkshare\security\reports"
+    ]
+    
+    while adding:
+        suggestions = [str(p) for p in additional_dirs] + common_locations
+        
+        dir_path = questionary.autocomplete(
+            "Enter directory path:",
+            choices=suggestions
+        ).ask()
+        
+        path = Path(dir_path)
+        
+        if not path.exists():
+            create = questionary.confirm(
+                f"Directory {path} does not exist. Create it?",
+                default=True
+            ).ask()
+            
+            if create:
+                try:
+                    path.mkdir(parents=True, exist_ok=True)
+                    console.print(f"[green]Created directory: {path}[/green]")
+                    additional_dirs.append(path)
+                except Exception as e:
+                    console.print(f"[red]Error creating directory: {e}[/red]")
+        else:
+            additional_dirs.append(path)
+        
+        adding = questionary.confirm(
+            "Add another directory?",
+            default=False
+        ).ask()
+    
+    return additional_dirs
+
+def confirm_execution_plan(mode, accounts, directories):
+    """Display execution plan summary and get user confirmation."""
+    table = RichTable(title="Execution Plan")
+    
+    table.add_column("Category", style="cyan")
+    table.add_column("Details", style="green")
+    
+    table.add_row("Mode", f"[bold]{mode.capitalize()}[/bold]")
+    table.add_row("AWS Accounts", f"{len(accounts)} account(s)")
+    table.add_row("Local Directories", f"{len(directories)} directory(ies)")
+    
+    console.print(table)
+    
+    if len(accounts) <= 5:
+        console.print("[cyan]Accounts to scan:[/cyan]")
+        for account in accounts:
+            console.print(f"  - {account}")
+    
+    console.print("[cyan]Directories to scan:[/cyan]")
+    for directory in directories:
+        console.print(f"  - {directory}")
+    
+    return questionary.confirm(
+        "Do you want to proceed with this plan?",
+        default=True
+    ).ask()
+
+def show_completion_summary(findings_count, output_file):
+    """Display completion summary."""
+    console.print(Panel.fit(
+        f"[green]Report generated successfully![/green]\n\n"
+        f"Total findings: [bold]{findings_count}[/bold]\n"
+        f"Output file: [bold]{output_file}[/bold]",
+        title="Completion Summary",
+        border_style="green"
+    ))
+
+# ----------------------------------------------------------------------------
+# Main Function
+# ----------------------------------------------------------------------------
+
+def main():
+    """Main entry point for the AWS Security Reporter tool."""
+    # Initialize console for rich output
+    console = Console()
+    
+    # Setup logging
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting AWS Security Reporter")
+    
+    try:
+        # Load configuration
+        config = load_config()
+        
+        # Get execution mode (centralized or targeted)
+        mode = get_execution_mode()
+        
+        # Get AWS credentials/profile
+        aws_credentials = get_aws_credentials(mode)
+        
+        # Validate AWS access
+        validate_aws_access(aws_credentials)
+        
+        # Get accounts to scan based on mode
+        if mode == "centralized":
+            accounts = get_organization_accounts(aws_credentials)
+        else:
+            accounts = [aws_credentials.get("account_id")]
+        
+        # Confirm local report directory access
+        default_dir = Path(r"C:\User\jgray\OneDrive - DOI\Document\2025 Security Hub Reports")
+        local_dirs = confirm_local_directories([default_dir])
+        
+        # Get additional directories
+        additional_dirs = get_additional_directories()
+        all_dirs = local_dirs + additional_dirs
+        
+        # Confirm execution plan
+        if not confirm_execution_plan(mode, accounts, all_dirs):
+            console.print("[yellow]Operation cancelled by user[/yellow]")
+            return
+        
+        # Process AWS Security Hub findings
+        findings = []
+        
+        with Progress() as progress:
+            # Task for AWS findings retrieval
+            aws_task = progress.add_task("[cyan]Retrieving AWS Security Hub findings...", total=len(accounts))
+            
+            for account_id in accounts:
+                account_findings = get_security_hub_findings(aws_credentials, account_id)
+                findings.extend(parse_security_hub_findings(account_findings, account_id))
+                progress.update(aws_task, advance=1)
+            
+            # Task for local report processing
+            local_task = progress.add_task("[green]Processing local report files...", total=len(all_dirs))
+            
+            for directory in all_dirs:
+                excel_findings = parse_excel_reports(directory)
+                findings.extend(excel_findings)
+                progress.update(local_task, advance=1)
+            
+            # Task for merging and analysis
+            merge_task = progress.add_task("[magenta]Merging and analyzing findings...", total=1)
+            consolidated_findings = merge_security_findings(findings)
+            progress.update(merge_task, advance=1)
+            
+            # Task for report generation
+            export_task = progress.add_task("[yellow]Generating Excel report...", total=1)
+            output_file = generate_excel_report(consolidated_findings, mode)
+            progress.update(export_task, advance=1)
+        
+        # Show completion summary
+        show_completion_summary(len(consolidated_findings), output_file)
+        
+        # Save user preferences for next run
+        save_user_preferences({
+            "last_mode": mode,
+            "last_directories": [str(d) for d in all_dirs]
+        })
+        
+        logger.info(f"Successfully completed security report generation: {output_file}")
+        
+    except Exception as e:
+        logger.exception(f"Error during execution: {str(e)}")
+        console.print(f"[bold red]Error:[/bold red] {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
