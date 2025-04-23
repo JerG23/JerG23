@@ -1,0 +1,95 @@
+#!/bin/bash
+
+CURRENT_DATE=$(date +"%Y-%m-%d")
+OUTPUT_FILE="iam_users_report.csv"
+
+echo "ReportDate: $CURRENT_DATE" > $OUTPUT_FILE
+echo "AccountID,Username,GroupMembership,LastLogin,ConsoleAccess,ProgrammaticAccess,AccountStatus,MFAEnabled,LastActivity" >> $OUTPUT_FILE
+
+# Function to check MFA status
+check_mfa_status() {
+  USERNAME=$1
+  MFA_DEVICES=$(aws iam list-mfa-devices --user-name "$USERNAME" --query 'MFADevices' --output json)
+  if [ "$(echo "$MFA_DEVICES" | jq length)" -gt 0 ]; then
+    echo "Enabled"
+  else
+    echo "Disabled"
+  fi
+}
+
+# Function to check access types and summarize
+get_access_status() {
+  USERNAME=$1
+
+  if aws iam get-login-profile --user-name "$USERNAME" >/dev/null 2>&1; then
+    CONSOLE_ACCESS="Enabled"
+  else
+    CONSOLE_ACCESS="Disabled"
+  fi
+
+  ACCESS_KEY_STATUS=$(aws iam list-access-keys --user-name "$USERNAME" --query 'AccessKeyMetadata[?Status==`Active`].AccessKeyId' --output text)
+  if [ -z "$ACCESS_KEY_STATUS" ]; then
+    PROGRAMMATIC_ACCESS="Disabled"
+  else
+    PROGRAMMATIC_ACCESS="Enabled"
+  fi
+
+  if [ "$CONSOLE_ACCESS" = "Enabled" ] || [ "$PROGRAMMATIC_ACCESS" = "Enabled" ]; then
+    ACCOUNT_STATUS="Enabled"
+  else
+    ACCOUNT_STATUS="Disabled"
+  fi
+
+  echo "$CONSOLE_ACCESS,$PROGRAMMATIC_ACCESS,$ACCOUNT_STATUS"
+}
+
+# Function to get last activity across login and API use
+get_last_activity() {
+  USERNAME=$1
+  LAST_USED=""
+  
+  # Start with password last used
+  PW_USED=$(aws iam get-user --user-name "$USERNAME" --query 'User.PasswordLastUsed' --output text 2>/dev/null)
+  if [ "$PW_USED" != "None" ]; then
+    LAST_USED=$PW_USED
+  fi
+
+  # Now check each access key
+  ACCESS_KEYS=$(aws iam list-access-keys --user-name "$USERNAME" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+  for KEY in $ACCESS_KEYS; do
+    KEY_LAST_USED=$(aws iam get-access-key-last-used --access-key-id "$KEY" --query 'AccessKeyLastUsed.LastUsedDate' --output text 2>/dev/null)
+    if [ "$KEY_LAST_USED" != "None" ] && [[ "$KEY_LAST_USED" > "$LAST_USED" ]]; then
+      LAST_USED=$KEY_LAST_USED
+    fi
+  done
+
+  if [ -z "$LAST_USED" ]; then
+    echo "Never Active"
+  else
+    echo "$LAST_USED"
+  fi
+}
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+USERS=$(aws iam list-users --query 'Users[*].UserName' --output text)
+
+for USERNAME in $USERS; do
+  (
+    LAST_LOGIN=$(aws iam get-user --user-name "$USERNAME" --query 'User.PasswordLastUsed' --output text 2>/dev/null)
+    if [ "$LAST_LOGIN" == "None" ]; then
+      LAST_LOGIN="Never logged in"
+    fi
+
+    GROUPS=$(aws iam list-groups-for-user --user-name "$USERNAME" --query 'Groups[].GroupName' --output text | tr '\n' ';')
+
+    IFS=',' read -r CONSOLE_ACCESS PROGRAMMATIC_ACCESS ACCOUNT_STATUS <<< "$(get_access_status "$USERNAME")"
+    MFA_ENABLED=$(check_mfa_status "$USERNAME")
+    LAST_ACTIVITY=$(get_last_activity "$USERNAME")
+
+    echo "$ACCOUNT_ID,$USERNAME,$GROUPS,$LAST_LOGIN,$CONSOLE_ACCESS,$PROGRAMMATIC_ACCESS,$ACCOUNT_STATUS,$MFA_ENABLED,$LAST_ACTIVITY" >> $OUTPUT_FILE
+  ) &
+done
+
+wait
+
+echo "IAM user report saved to $OUTPUT_FILE."
