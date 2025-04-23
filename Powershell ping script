@@ -1,0 +1,38 @@
+# Prompt user to input a list of DNS names or IP addresses
+$addresses = Read-Host "Enter a list of DNS names or IP addresses, separated by commas" | 
+    Out-String | 
+    Split-Path -Delimiter ',' | 
+    ForEach-Object { $_.Trim() }
+
+# Create two lists to store online and offline addresses
+$onlineAddresses = @()
+$offlineAddresses = @()
+
+# Loop through each address and categorize
+foreach ($address in $addresses) {
+    # Test the connection (ping)
+    $pingResult = Test-Connection -ComputerName $address -Count 1 -Quiet
+    
+    # Add to appropriate list based on the ping result
+    if ($pingResult) {
+        $onlineAddresses += $address
+    } else {
+        $offlineAddresses += $address
+    }
+}
+
+# Output ONLINE addresses first
+if ($onlineAddresses.Count -gt 0) {
+    Write-Host "ONLINE:" -ForegroundColor Green
+    foreach ($online in $onlineAddresses) {
+        Write-Host "$online is ONLINE" -ForegroundColor Green
+    }
+}
+
+# Output OFFLINE addresses next
+if ($offlineAddresses.Count -gt 0) {
+    Write-Host "`nOFFLINE:" -ForegroundColor Red
+    foreach ($offline in $offlineAddresses) {
+        Write-Host "$offline is OFFLINE" -ForegroundColor Red
+    }
+}
