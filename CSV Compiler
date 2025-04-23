@@ -1,0 +1,26 @@
+import pandas as pd
+import os
+from datetime import datetime
+
+# Define the path to the directory containing your CSV files
+csv_directory = r'C:\path\to\your\csv\files'
+
+# Create a new Excel writer object
+output_filename = f"combined_data_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+    # Loop through all CSV files in the specified directory
+    for filename in os.listdir(csv_directory):
+        if filename.endswith('.csv'):
+            # Build the full file path
+            file_path = os.path.join(csv_directory, filename)
+            
+            # Read the CSV file into a DataFrame
+            df = pd.read_csv(file_path)
+            
+            # Use the filename (without extension) as the sheet name
+            sheet_name = os.path.splitext(filename)[0]
+            
+            # Write the DataFrame to the Excel file with the specified sheet name
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+print(f"Combined Excel file created: {output_filename}")
