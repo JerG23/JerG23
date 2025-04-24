@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# Define function to list active AWS regions
+get_regions() {
+    echo "us-east-1 us-west-1 us-west-2"
+}
+
+# Function to check CloudTrail
+check_cloudtrail() {
+    local region=$1
+    local trails
+    trails=$(aws cloudtrail describe-trails --region "$region" --query "trailList[].Name" --output text 2>/dev/null)
+    if [[ -z "$trails" ]]; then
+        echo "  CloudTrail: Not Configured in $region"
+    else
+        echo "  CloudTrail: Configured in $region - Trails: $trails"
+    fi
+}
+
+# Function to check GuardDuty
+check_guardduty() {
+    local region=$1
+    local detector_id
+    detector_id=$(aws guardduty list-detectors --region "$region" --query "DetectorIds[0]" --output text 2>/dev/null)
+    if [[ "$detector_id" == "None" || -z "$detector_id" ]]; then
+        echo "  GuardDuty: Not Enabled in $region"
+    else
+        echo "  GuardDuty: Enabled in $region"
+    fi
+}
+
+# Function to check Security Hub
+check_securityhub() {
+    local region=$1
+    local status
+    status=$(aws securityhub get-enabled-standards --region "$region" --query "StandardsSubscriptions" --output text 2>/dev/null)
+    if [[ -z "$status" ]]; then
+        echo "  Security Hub: Not Enabled in $region"
+    else
+        echo "  Security Hub: Enabled in $region"
+    fi
+}
+
+# Main Script Execution
+echo "Starting AWS Security Audit..."
+
+account_id=$(aws sts get-caller-identity --query "Account" --output text 2>/dev/null)
+if [[ -z "$account_id" ]]; then
+    echo "Error: Unable to retrieve AWS account ID. Please ensure you are authenticated."
+    exit 1
+fi
+echo "Audit Summary for AWS Account: $account_id"
+
+regions=$(get_regions)
+
+for region in $regions; do
+    echo "Checking security services in region: $region"
+    check_cloudtrail "$region"
+    check_guardduty "$region"
+    check_securityhub "$region"
+    echo ""
+done
+
+echo "AWS Security Audit Completed."
