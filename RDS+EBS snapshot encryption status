@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Initialize counters for encrypted and unencrypted resources
+total_ebs_snapshots_encrypted=0
+total_ebs_snapshots_unencrypted=0
+total_rds_snapshots_encrypted=0
+total_rds_snapshots_unencrypted=0
+total_ebs_volumes_encrypted=0
+total_ebs_volumes_unencrypted=0
+
+# Fetch total EBS snapshots and count encrypted and unencrypted
+echo "Fetching EBS snapshots..."
+ebs_snapshots=$(aws ec2 describe-snapshots --query "Snapshots[*].{ID:SnapshotId,Encrypted:Encrypted}" --output text)
+
+# Count encrypted and unencrypted EBS snapshots
+total_ebs_snapshots_encrypted=$(echo "$ebs_snapshots" | grep -c 'True')
+total_ebs_snapshots_unencrypted=$(echo "$ebs_snapshots" | grep -c 'False')
+
+# Fetch total EBS volumes and count encrypted and unencrypted
+echo "Fetching EBS volumes..."
+ebs_volumes=$(aws ec2 describe-volumes --query "Volumes[*].{ID:VolumeId,Encrypted:Encrypted}" --output text)
+
+# Count encrypted and unencrypted EBS volumes
+total_ebs_volumes_encrypted=$(echo "$ebs_volumes" | grep -c 'True')
+total_ebs_volumes_unencrypted=$(echo "$ebs_volumes" | grep -c 'False')
+
+# Fetch total RDS snapshots and count encrypted and unencrypted
+echo "Fetching RDS snapshots..."
+rds_snapshots=$(aws rds describe-db-snapshots --query "DBSnapshots[*].{ID:DBSnapshotIdentifier,Encrypted:Encrypted}" --output text)
+
+# Count encrypted and unencrypted RDS snapshots
+total_rds_snapshots_encrypted=$(echo "$rds_snapshots" | grep -c 'True')
+total_rds_snapshots_unencrypted=$(echo "$rds_snapshots" | grep -c 'False')
+
+# Output the results in a table format
+echo ""
+echo "Resource Type               | Encrypted | Unencrypted"
+echo "--------------------------------------------------------"
+echo "EBS Snapshots               | $total_ebs_snapshots_encrypted | $total_ebs_snapshots_unencrypted"
+echo "EBS Volumes                 | $total_ebs_volumes_encrypted   | $total_ebs_volumes_unencrypted"
+echo "RDS Snapshots               | $total_rds_snapshots_encrypted | $total_rds_snapshots_unencrypted"
