@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Array of all AWS regions
+regions=$(aws ec2 describe-regions --query "Regions[].RegionName" --output text)
+
+# Initialize counters and summary variables
+total_regions=0
+regions_with_issues=0
+regions_with_no_patch_lambda=0
+regions_with_no_sns_topics=0
+regions_with_no_patch_compliance=0
+
+echo "=== Patching Audit Across All Regions ==="
+
+for region in $regions; do
+    echo "Auditing region: $region"
+
+    # Set region for AWS CLI
+    export AWS_DEFAULT_REGION=$region
+
+    region_issues=0
+    region_summary="Region: $region\n"
+
+    echo "=== Checking SNS Topics Related to Patching ==="
+    sns_topics=$(aws sns list-topics --query "Topics[].TopicArn" --output text)
+    if [ -z "$sns_topics" ]; then
+        region_summary+="No SNS topics found related to patching.\n"
+        regions_with_no_sns_topics=$((regions_with_no_sns_topics + 1))
+        region_issues=1
+    else
+        for topic in $sns_topics; do
+            region_summary+="Found SNS Topic: $topic\n"
+            aws sns list-subscriptions-by-topic --topic-arn "$topic" --query "Subscriptions[].{Endpoint:Endpoint,Protocol:Protocol,SubscriptionArn:SubscriptionArn}" --output table
+        done
+    fi
+
+    echo "=== Checking Lambda Functions Related to Patching ==="
+    lambda_functions=$(aws lambda list-functions --query "Functions[?contains(FunctionName, 'patch') || contains(FunctionName, 'Patch')].[FunctionName]" --output text)
+    if [ -z "$lambda_functions" ]; then
+        region_summary+="No Lambda functions related to patching found.\n"
+        regions_with_no_patch_lambda=$((regions_with_no_patch_lambda + 1))
+        region_issues=1
+    else
+        for function in $lambda_functions; do
+            region_summary+="Found Lambda Function: $function\n"
+            aws lambda get-function --function-name "$function" --query "Configuration.{FunctionName:FunctionName,Runtime:Runtime,LastModified:LastModified,Handler:Handler,Timeout:Timeout,Role:Role}" --output table
+        done
+    fi
+
+    echo "=== Checking AWS Patch Manager Notifications ==="
+    aws ssm describe-maintenance-window-tasks --query "Tasks[?NotificationConfig.NotificationArn != null].[WindowId, TaskArn, NotificationArn, ServiceRoleArn]" --output table || region_summary+="No maintenance window tasks found.\n"
+    aws ssm describe-instance-patch-states --query "InstancePatchStates[].{InstanceId:InstanceId,PatchGroup:PatchGroup,LastNoRebootInstallOperationTime:LastNoRebootInstallOperationTime,Compliance:ComplianceStatus}" --output table || region_summary+="No patch compliance data found.\n"
+
+    echo "$region_summary"
+
+    # If there were issues found in the region, increase the counter
+    if [ $region_issues -gt 0 ]; then
+        regions_with_issues=$((regions_with_issues + 1))
+    fi
+
+    total_regions=$((total_regions + 1))
+    echo "Finished auditing region: $region."
+    echo "---------------------------------------------------"
+done
+
+# Human-readable summary at the end
+echo "=== Audit Summary ==="
+echo "Total Regions Audited: $total_regions"
+echo "Regions with Patching Issues: $regions_with_issues"
+echo "Regions with No Patch Lambda Functions: $regions_with_no_patch_lambda"
+echo "Regions with No SNS Topics: $regions_with_no_sns_topics"
+echo "Regions with No Patch Compliance Data: $regions_with_no_patch_compliance"
+echo "Audit Completed!"
