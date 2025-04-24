@@ -1,0 +1,88 @@
+import boto3
+import openpyxl
+import argparse
+from openpyxl.utils import get_column_letter
+
+# Function to get all security groups and rules
+def get_security_groups(region, profile):
+    # Create a boto3 session with the specified profile and region
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2_client = session.client('ec2')
+
+    security_groups = []
+
+    # Get all security groups in the account
+    response = ec2_client.describe_security_groups()
+
+    for sg in response['SecurityGroups']:
+        sg_id = sg['GroupId']
+        sg_name = sg['GroupName']
+        description = sg['Description']
+
+        # Iterate over each security group rule (Ingress and Egress)
+        ingress_rules = sg.get('IpPermissions', [])
+        egress_rules = sg.get('IpPermissionsEgress', [])
+
+        security_groups.append({
+            'Security Group ID': sg_id,
+            'Security Group Name': sg_name,
+            'Description': description,
+            'Ingress Rules': ingress_rules,
+            'Egress Rules': egress_rules
+        })
+
+    return security_groups
+
+# Function to write security group data into an Excel file
+def write_to_excel(security_groups, filename='security_groups.xlsx'):
+    # Create an Excel workbook and sheet
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = 'Security Groups'
+
+    # Define header row
+    headers = ['Security Group ID', 'Security Group Name', 'Description', 'Rule Type', 'Protocol', 'Port Range', 'CIDR Block', 'Source/Destination']
+    sheet.append(headers)
+
+    # Write security group rules into Excel
+    for sg in security_groups:
+        sg_id = sg['Security Group ID']
+        sg_name = sg['Security Group Name']
+        description = sg['Description']
+
+        # Write Ingress Rules
+        for rule in sg['Ingress Rules']:
+            protocol = rule.get('IpProtocol', 'All traffic')
+            port_range = f"{rule.get('FromPort', 'Any')} - {rule.get('ToPort', 'Any')}"
+            for ip_range in rule.get('IpRanges', []):
+                cidr_block = ip_range.get('CidrIp', 'N/A')
+                source = ip_range.get('Description', 'N/A')
+                sheet.append([sg_id, sg_name, description, 'Ingress', protocol, port_range, cidr_block, source])
+
+        # Write Egress Rules
+        for rule in sg['Egress Rules']:
+            protocol = rule.get('IpProtocol', 'All traffic')
+            port_range = f"{rule.get('FromPort', 'Any')} - {rule.get('ToPort', 'Any')}"
+            for ip_range in rule.get('IpRanges', []):
+                cidr_block = ip_range.get('CidrIp', 'N/A')
+                source = ip_range.get('Description', 'N/A')
+                sheet.append([sg_id, sg_name, description, 'Egress', protocol, port_range, cidr_block, source])
+
+    # Save the workbook
+    workbook.save(filename)
+
+# Main function to fetch data and save to Excel
+def main(region, profile):
+    security_groups = get_security_groups(region, profile)
+    write_to_excel(security_groups)
+
+if __name__ == '__main__':
+    # Set up argument parsing
+    parser = argparse.ArgumentParser(description='Fetch AWS security groups and save them to an Excel file.')
+    parser.add_argument('--region', required=True, help='AWS region (e.g., us-east-1)')
+    parser.add_argument('--profile', required=True, help='AWS profile name to use')
+
+    args = parser.parse_args()
+
+    # Run the main function with arguments
+    main(args.region, args.profile)
