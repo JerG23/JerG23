@@ -1,0 +1,52 @@
+import boto3
+import logging
+import traceback
+import pandas as pd
+from datetime import datetime
+
+TARGET_PROFILES = [ "ir-doi-gpsi", "doi-trimble-prod-com", "imagery-data-management", "nhd-plus", "doi-keycloak-prod-com-1", "doi-keycloak-prod-com-2", "doi-osmre", "boem-odgip-prod-com", "fws-iris-mgmt-com", "fws-iris-prod-com", "fws-ecosphere-sandbox-com", "fws-ecosphere-common", "fws-ecosphere-dev", "fws-ecosphere-prod-com", "fws-ecosphere-test", "usgs-wim-wma", "gomcollab", "usgs-wim-prod", "usgs-wim-fws-cbrs", "usgs-wim-main", "usgs-wim-streamstats", "usgs-wim-fws-wetlands", "osmre-eamlis-prod-com", "usgs-shira-prod-com", "fws-tracs-prod", "bor-mp-gis", "doi-datainventory-dev-com", "fema-disasters-prod", "fema-disasters-sandbox", "fema-rmd-prod", "fema-rmd-1", "fema-rmd-2", "bia-bogs-prod-com", "nps-doi-1", "nps-doi-2", "nps-mapbox-prod-com", "nps-mapbox-dev-com", "nps-cartos-prod-com", "nps-cartos-dev-com", "nps-usmp-prod-com", "oas-safecom-staging", "doi-usdaiipp-prod-com", "usgs-trails-dev", "usgs-trails-prod", "doi-borgis-prod-com", "doi-ocio-ac-prod-com" ]  # Paste your full list here
+DEFAULT_REGION = "us-east-1"
+SEARCH_TERMS = ["cc", "cloudchckr"]
+LOG_LEVEL = logging.INFO
+
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger()
+
+results = []
+
+def search_iam_entities(profile_name):
+    try:
+        session = boto3.Session(profile_name=profile_name, region_name=DEFAULT_REGION)
+        iam_client = session.client('iam')
+
+        roles = iam_client.list_roles()['Roles']
+        users = iam_client.list_users()['Users']
+
+        matched_roles = [r['RoleName'] for r in roles if any(term in r['RoleName'].lower() for term in SEARCH_TERMS)]
+        matched_users = [u['UserName'] for u in users if any(term in u['UserName'].lower() for term in SEARCH_TERMS)]
+
+        for name in matched_roles:
+            results.append({'Profile': profile_name, 'Type': 'Role', 'Name': name})
+        for name in matched_users:
+            results.append({'Profile': profile_name, 'Type': 'User', 'Name': name})
+
+    except Exception as e:
+        logger.error(f"Error with profile '{profile_name}': {e}")
+        logger.debug(traceback.format_exc())
+
+def main():
+    logger.info("Starting IAM role/user audit...")
+    for profile in TARGET_PROFILES:
+        logger.info(f"Checking profile: {profile}")
+        search_iam_entities(profile)
+
+    if results:
+        df = pd.DataFrame(results)
+        filename = f"IAM_Role_Audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(filename, index=False)
+        logger.info(f"Results written to: {filename}")
+    else:
+        logger.info("No matching IAM roles or users found.")
+
+if __name__ == "__main__":
+    main()
