@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# Function to retrieve account number
+get_account_number() {
+    aws sts get-caller-identity --query "Account" --output text 2>/dev/null
+}
+
+# Function to get all AWS regions
+get_all_regions() {
+    aws ec2 describe-regions --query "Regions[?contains(RegionName, 'us-')].RegionName" --output text 2>/dev/null
+}
+
+# Function to check CloudTrail
+check_cloudtrail() {
+    local trails
+    trails=$(aws cloudtrail describe-trails --query "trailList[*].Name" --output text 2>/dev/null)
+    if [[ -z "$trails" ]]; then
+        echo "CloudTrail Enabled: No - CloudTrail is not configured to monitor API activity."
+    else
+        echo "CloudTrail Enabled: Yes - The following trails are configured: $trails"
+    fi
+}
+
+# Function to check GuardDuty
+check_guardduty() {
+    local detector_id
+    detector_id=$(aws guardduty list-detectors --query "DetectorIds[0]" --output text 2>/dev/null)
+    if [[ "$detector_id" == "None" || -z "$detector_id" ]]; then
+        echo "GuardDuty Enabled: No - GuardDuty is not enabled to monitor for potential threats."
+    else
+        echo "GuardDuty Enabled: Yes - GuardDuty is enabled."
+    fi
+}
+
+# EC2 instance check
+check_ec2_instances() {
+    local instances
+    instances=$(aws ec2 describe-instances --query "Reservations[*].Instances[*].[InstanceId, State.Name, InstanceType, Platform]" --output text 2>/dev/null)
+    if [[ -z "$instances" ]]; then
+        echo "EC2 Instances: No - No EC2 instances found in this account."
+    else
+        echo "EC2 Instances: Yes - Found the following instances:"
+        echo "$instances" | awk '{printf "  - Instance ID: %s, State: %s, Type: %s, Platform: %s\n", $1, $2, $3, $4}'
+    fi
+}
+
+# Function to check EBS encryption and backups
+check_ebs_encryption_and_backups() {
+    local total_volumes
+    local unencrypted_volumes
+    local unencrypted_snapshots
+    local total_snapshots
+    local latest_snapshot_date
+
+    # Check EBS volumes
+    total_volumes=$(aws ec2 describe-volumes --query "Volumes[*].VolumeId" --output text 2>/dev/null | wc -w)
+    unencrypted_volumes=$(aws ec2 describe-volumes --query "Volumes[?Encrypted==\`false\`].VolumeId" --output text 2>/dev/null)
+
+    if [[ -z "$unencrypted_volumes" ]]; then
+        echo "EBS Encryption: Yes - All $total_volumes EBS volumes are encrypted."
+    else
+        local unencrypted_count
+        unencrypted_count=$(echo "$unencrypted_volumes" | wc -w)
+        echo "EBS Encryption: No - $unencrypted_count unencrypted volumes found."
+        echo "Unencrypted Volume IDs: $unencrypted_volumes"
+    fi
+
+    # Check EBS snapshots
+    total_snapshots=$(aws ec2 describe-snapshots --owner-ids self --query "Snapshots[*].SnapshotId" --output text 2>/dev/null | wc -w)
+    unencrypted_snapshots=$(aws ec2 describe-snapshots --owner-ids self --query "Snapshots[?Encrypted==\`false\`].SnapshotId" --output text 2>/dev/null | wc -w)
+    latest_snapshot_date=$(aws ec2 describe-snapshots --owner-ids self --query "Snapshots | max_by(@, &StartTime).StartTime" --output text 2>/dev/null)
+
+    echo "Total EBS Snapshots: $total_snapshots"
+    echo "Unencrypted Snapshots: $unencrypted_snapshots"
+    if [[ "$total_snapshots" -gt 0 ]]; then
+        echo "Latest EBS Snapshot Backup: $latest_snapshot_date"
+    else
+        echo "No EBS snapshot backups found."
+    fi
+}
+
+
+
+# Function to check RDS encryption and backups
+check_rds_encryption_and_backups() {
+    local db_instances
+    local total_db_instances
+    local unencrypted_instances=()
+    local recent_backup_date
+
+    # Check RDS encryption
+    db_instances=$(aws rds describe-db-instances --query "DBInstances[*].DBInstanceIdentifier" --output text 2>/dev/null)
+    total_db_instances=$(echo "$db_instances" | wc -w)
+
+    if [[ "$total_db_instances" -eq 0 ]]; then
+        echo "RDS Encryption: N/A - No RDS instances found."
+    else
+        for db in $db_instances; do
+            encrypted=$(aws rds describe-db-instances --db-instance-identifier "$db" --query "DBInstances[0].StorageEncrypted" --output text 2>/dev/null)
+            if [[ "$encrypted" == "False" ]]; then
+                unencrypted_instances+=("$db")
+            fi
+        done
+        if [[ "${#unencrypted_instances[@]}" -eq 0 ]]; then
+            echo "RDS Encryption: Yes - All $total_db_instances RDS instances are encrypted."
+        else
+            echo "RDS Encryption: No - ${#unencrypted_instances[@]} unencrypted instances found."
+            echo "Unencrypted Instance IDs: ${unencrypted_instances[*]}"
+        fi
+    fi
+
+    # Check RDS backups
+    recent_backup_date=$(aws rds describe-db-snapshots --query "DBSnapshots | max_by(@, &SnapshotCreateTime).SnapshotCreateTime" --output text 2>/dev/null)
+    if [[ -n "$recent_backup_date" ]]; then
+        echo "Latest RDS Backup: $recent_backup_date"
+    else
+        echo "RDS Backups: No backups found."
+    fi
+}
+# Function to audit S3 buckets
+check_s3_resources() {
+    local buckets
+    local total_buckets
+    local public_buckets=0
+    local unencrypted_buckets=()
+    local no_logging_buckets=()
+    local risky_policies=()
+
+    echo "Starting S3 Resource Audit..."
+
+    # Fetch all bucket names
+    buckets=$(aws s3api list-buckets --query "Buckets[].Name" --output text 2>/dev/null)
+    total_buckets=$(echo "$buckets" | wc -w)
+
+    for bucket in $buckets; do
+        # Check bucket public access
+        public_access=$(aws s3api get-bucket-acl --bucket "$bucket" --query "Grants[?Grantee.URI=='http://acs.amazonaws.com/groups/global/AllUsers' || Grantee.URI=='http://acs.amazonaws.com/groups/global/AuthenticatedUsers']" --output text 2>/dev/null)
+        if [[ -n "$public_access" ]]; then
+            public_buckets=$((public_buckets + 1))
+        fi
+
+        # Check bucket encryption
+        encryption=$(aws s3api get-bucket-encryption --bucket "$bucket" 2>/dev/null || echo "NotEncrypted")
+        if [[ "$encryption" == "NotEncrypted" ]]; then
+            unencrypted_buckets+=("$bucket")
+        fi
+
+        # Check bucket logging
+        logging=$(aws s3api get-bucket-logging --bucket "$bucket" --query "LoggingEnabled" --output text 2>/dev/null)
+        if [[ -z "$logging" ]]; then
+            no_logging_buckets+=("$bucket")
+        fi
+
+        # Check for risky bucket policies
+        policy=$(aws s3api get-bucket-policy --bucket "$bucket" --query "Policy" --output text 2>/dev/null)
+        if [[ -n "$policy" ]]; then
+            risky_policy_check=$(echo "$policy" | grep -E '"Effect": "Allow".*"Principal": "\*"' || true)
+            if [[ -n "$risky_policy_check" ]]; then
+                risky_policies+=("$bucket")
+            fi
+        fi
+    done
+
+    # Output the results
+    echo "Total S3 Buckets: $total_buckets"
+    echo "Buckets with Public Access: $public_buckets"
+    if [[ ${#unencrypted_buckets[@]} -gt 0 ]]; then
+        echo "Buckets Not Encrypted: ${unencrypted_buckets[*]}"
+    fi
+    if [[ ${#no_logging_buckets[@]} -gt 0 ]]; then
+        echo "Buckets Without Logging Enabled: ${no_logging_buckets[*]}"
+    fi
+    if [[ ${#risky_policies[@]} -gt 0 ]]; then
+        echo "Buckets with Risky Policies: ${risky_policies[*]}"
+    fi
+}
+
+check_waf_status() {
+    local web_acls
+    local total_acls
+
+    echo "Checking WAF Status..."
+
+    # Fetch WAF web ACLs
+    web_acls=$(aws wafv2 list-web-acls --scope REGIONAL --query "WebACLs[].Name" --output text 2>/dev/null)
+    total_acls=$(echo "$web_acls" | wc -w)
+
+    if [[ "$total_acls" -eq 0 ]]; then
+        echo "WAF Status: No WAF Web ACLs found."
+    else
+        echo "WAF Status: $total_acls WAF Web ACL(s) found."
+        for acl in $web_acls; do
+            resources=$(aws wafv2 get-web-acl --name "$acl" --scope REGIONAL --query "WebACL.AssociatedResourceArn" --output text 2>/dev/null)
+            echo "  - Web ACL: $acl"
+            echo "    Associated Resources: $resources"
+        done
+    fi
+}
+
+# Integrate into aggregated summary
+aggregate_summary_across_regions() {
+    local regions
+    regions=$(get_all_regions)
+
+    echo "Aggregated Summary for All Regions (US):"
+    for region in $regions; do
+        echo "-------------------------------------------------"
+        echo "Region: $region"
+        export AWS_REGION=$region
+        check_cloudtrail
+        check_guardduty
+        check_ec2_instances
+        check_ebs_encryption_and_backups
+        check_rds_encryption_and_backups
+        check_s3_resources
+        check_waf_status
+        echo "-------------------------------------------------"
+    done
+}
+
+# Main script
+account_number=$(get_account_number)
+
+{
+    echo "Audit Summary for Account: $account_number"
+    check_cloudtrail
+    check_guardduty
+    check_ec2_instances
+    check_ebs_encryption_and_backups
+    check_rds_encryption_and_backups
+    check_s3_resources
+    check_waf_status
+} | tee audit_summary.txt
+
+# Initialize global variables for summary
+global_unencrypted_volumes=0
+global_unencrypted_snapshots=0
+global_public_buckets=0
+global_unencrypted_buckets=0
+global_no_logging_buckets=0
+global_unencrypted_rds_instances=0
+
+# Function to aggregate findings across regions
+aggregate_summary_across_regions() {
+    local regions
+    regions=$(get_all_regions)
+
+    echo "Aggregated Summary for All Regions (US):"
+    for region in $regions; do
+        echo "-------------------------------------------------"
+        echo "Region: $region"
+        export AWS_REGION=$region
+
+        # EBS Checks
+        local region_unencrypted_volumes
+        region_unencrypted_volumes=$(aws ec2 describe-volumes --query "Volumes[?Encrypted==\`false\`].VolumeId" --output text 2>/dev/null | wc -w)
+        global_unencrypted_volumes=$((global_unencrypted_volumes + region_unencrypted_volumes))
+
+        local region_unencrypted_snapshots
+        region_unencrypted_snapshots=$(aws ec2 describe-snapshots --owner-ids self --query "Snapshots[?Encrypted==\`false\`].SnapshotId" --output text 2>/dev/null | wc -w)
+        global_unencrypted_snapshots=$((global_unencrypted_snapshots + region_unencrypted_snapshots))
+
+        # S3 Checks
+        local region_buckets
+        region_buckets=$(aws s3api list-buckets --query "Buckets[].Name" --output text 2>/dev/null)
+        for bucket in $region_buckets; do
+            # Check encryption
+            local encryption
+            encryption=$(aws s3api get-bucket-encryption --bucket "$bucket" 2>/dev/null || echo "NotEncrypted")
+            if [[ "$encryption" == "NotEncrypted" ]]; then
+                global_unencrypted_buckets=$((global_unencrypted_buckets + 1))
+            fi
+
+            # Check logging
+            local logging
+            logging=$(aws s3api get-bucket-logging --bucket "$bucket" --query "LoggingEnabled" --output text 2>/dev/null)
+            if [[ -z "$logging" ]]; then
+                global_no_logging_buckets=$((global_no_logging_buckets + 1))
+            fi
+
+            # Check public access
+            local public_access
+            public_access=$(aws s3api get-bucket-acl --bucket "$bucket" --query "Grants[?Grantee.URI=='http://acs.amazonaws.com/groups/global/AllUsers' || Grantee.URI=='http://acs.amazonaws.com/groups/global/AuthenticatedUsers']" --output text 2>/dev/null)
+            if [[ -n "$public_access" ]]; then
+                global_public_buckets=$((global_public_buckets + 1))
+            fi
+        done
+
+        # RDS Checks
+        local region_db_instances
+        region_db_instances=$(aws rds describe-db-instances --query "DBInstances[*].DBInstanceIdentifier" --output text 2>/dev/null)
+        for db in $region_db_instances; do
+            local encrypted
+            encrypted=$(aws rds describe-db-instances --db-instance-identifier "$db" --query "DBInstances[0].StorageEncrypted" --output text 2>/dev/null)
+            if [[ "$encrypted" == "False" ]]; then
+                global_unencrypted_rds_instances=$((global_unencrypted_rds_instances + 1))
+            fi
+        done
+
+        echo "Region Summary Completed: $region"
+    done
+
+    # Output global summary
+    echo "-------------------------------------------------"
+    echo "Global Summary Across All Regions:"
+    echo "Unencrypted EBS Volumes: $global_unencrypted_volumes"
+    echo "Unencrypted EBS Snapshots: $global_unencrypted_snapshots"
+    echo "Public S3 Buckets: $global_public_buckets"
+    echo "Unencrypted S3 Buckets: $global_unencrypted_buckets"
+    echo "S3 Buckets Without Logging: $global_no_logging_buckets"
+    echo "Unencrypted RDS Instances: $global_unencrypted_rds_instances"
+    echo "-------------------------------------------------"
+}
+
+
+# Main Script Execution
+account_number=$(get_account_number)
+
+echo "Audit Summary for Account: $account_number" | tee audit_summary.txt
+
+# Call the global aggregation function and save to audit file
+aggregate_summary_across_regions | tee -a audit_summary.txt
+
+
