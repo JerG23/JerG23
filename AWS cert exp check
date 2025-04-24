@@ -1,0 +1,444 @@
+import boto3
+import pandas as pd
+import os
+import logging
+import traceback
+import re
+from datetime import datetime, timezone, timedelta
+
+# --- Configuration ---
+
+# Required: List of AWS CLI Profile names corresponding to target accounts/regions
+TARGET_PROFILES = [
+    "doi-gpsi", 
+    "doi-trimble-prod-com", 
+    "imagery-data-management", 
+    "nhd-plus", 
+    "doi-keycloak-prod-com-1", 
+    "doi-keycloak-prod-com-2", 
+    "doi-osmre", 
+    "boem-odgip-prod-com", 
+    "fws-iris-mgmt-com", 
+    "fws-iris-prod-com", 
+    "fws-ecosphere-sandbox-com", 
+    "fws-ecosphere-common", 
+    "fws-ecosphere-dev", 
+    "fws-ecosphere-prod-com", 
+    "fws-ecosphere-test", 
+    "usgs-wim-wma", 
+    "gomcollab", 
+    "usgs-wim-prod", 
+    "usgs-wim-fws-cbrs", 
+    "usgs-wim-main", 
+    "usgs-wim-streamstats", 
+    "usgs-wim-fws-wetlands", 
+    "osmre-eamlis-prod-com", 
+    "usgs-shira-prod-com", 
+    "fws-tracs-prod", 
+    "bor-mp-gis", 
+    "doi-datainventory-dev-com", 
+    "fema-disasters-prod", 
+    "fema-disasters-sandbox", 
+    "fema-rmd-prod", 
+    "fema-rmd-1", 
+    "fema-rmd-2", 
+    "bia-bogs-prod-com", 
+    "nps-doi-1", 
+    "nps-doi-2", 
+    "nps-mapbox-prod-com", 
+    "nps-mapbox-dev-com", 
+    "nps-cartos-prod-com", 
+    "nps-cartos-dev-com", 
+    "nps-usmp-prod-com", 
+    "oas-safecom-staging", 
+    "doi-usdaiipp-prod-com", 
+    "usgs-trails-dev", 
+    "usgs-trails-prod", 
+    "doi-borgis-prod-com", 
+    "doi-ocio-ac-prod-com"    
+] # CHANGE_ME
+
+# Optional: Specify an output directory
+OUTPUT_DIR = ""
+
+# Optional: Customize logging level
+LOG_LEVEL = logging.INFO
+
+# Optional: Threshold for 'Expires Soon' warning (in days)
+EXPIRY_THRESHOLD_DAYS = 30
+
+# --- Constants ---
+MAX_SHEET_NAME_LENGTH = 30
+# --- CHANGE: Added 'Certificate Domains' and adjusted order ---
+COLUMN_ORDER = [
+    'Account Number', 'Account Name', 'Region', 'Service', 'Resource Name/ID',
+    'Listener/Behavior', 'Certificate ARN', 'Certificate Domains',
+    'Certificate Expiry Date', 'Status'
+]
+EXCEL_DATE_FORMAT = 'yyyy-mm-dd hh:mm:ss'
+
+# --- Logging Setup ---
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(LOG_LEVEL)
+log_handler = logging.StreamHandler()
+log_formatter = logging.Formatter('%(levelname)s:%(asctime)s:%(name)s:%(message)s')
+log_handler.setFormatter(log_formatter)
+if not _LOGGER.hasHandlers():
+    _LOGGER.addHandler(log_handler)
+
+# --- Helper Functions ---
+def sanitize_sheet_name(sheet_name):
+    # Sanitizer might not be needed if only using one sheet, but keep for safety
+    if not sheet_name: return "Unnamed_Account"
+    sanitized = re.sub(r'[\\/*?\[\]:]', '_', sheet_name)
+    return sanitized[:MAX_SHEET_NAME_LENGTH]
+
+# --- Caches (Global) ---
+cert_details_cache = {} # {cert_arn: {'expiry': dt_aware, 'domains': list, 'error': msg}}
+client_cache = {} # { (profile, region, service) : client }
+
+def get_cached_client(service, session, region_name):
+    """Gets or creates a boto3 client using a cache."""
+    profile_name = session.profile_name
+    cache_key = (profile_name, region_name, service)
+    if cache_key not in client_cache:
+         _LOGGER.debug(f"Creating new client for {service} in {region_name} for profile {profile_name}")
+         try:
+              if service == 'iam': client_cache[cache_key] = session.client(service, region_name='us-east-1')
+              else: client_cache[cache_key] = session.client(service, region_name=region_name)
+         except Exception as e:
+              _LOGGER.error(f"Failed to create client {service} in {region_name} for profile {profile_name}: {e}")
+              client_cache[cache_key] = None
+    return client_cache[cache_key]
+
+# --- CHANGE: Modified function to return domains ---
+def get_cert_expiry_and_domains(cert_arn, required_region, session):
+    """Gets expiry date and domains, using cache. Handles ACM/IAM."""
+    if cert_arn in cert_details_cache:
+        return cert_details_cache[cert_arn]
+
+    result = {'expiry': None, 'domains': [], 'error': None} # Initialize domains as list
+    _LOGGER.debug(f"Fetching details for cert {cert_arn} in region {required_region}")
+
+    try:
+        if cert_arn.startswith('arn:aws:acm:'):
+            acm_client = get_cached_client('acm', session, required_region)
+            if acm_client:
+                response = acm_client.describe_certificate(CertificateArn=cert_arn)
+                cert_data = response['Certificate']
+                result['expiry'] = cert_data.get('NotAfter')
+                # Extract domains
+                domain_set = set()
+                if cert_data.get('DomainName'):
+                     domain_set.add(cert_data['DomainName'])
+                if cert_data.get('SubjectAlternativeNames'):
+                     domain_set.update(cert_data['SubjectAlternativeNames'])
+                result['domains'] = sorted(list(domain_set)) # Store sorted list
+            else:
+                result['error'] = "ACM Client Error"
+        elif cert_arn.startswith('arn:aws:iam::'):
+             cert_name = cert_arn.split('/')[-1]
+             iam_client = get_cached_client('iam', session, 'us-east-1')
+             if iam_client:
+                  response = iam_client.get_server_certificate(ServerCertificateName=cert_name)
+                  result['expiry'] = response['ServerCertificate']['ServerCertificateMetadata']['Expiration']
+                  # IAM certs don't easily expose SANs via this API, only name in ARN
+                  result['domains'] = [f"IAM: {cert_name}"]
+             else:
+                  result['error'] = "IAM Client Error"
+        else:
+            result['error'] = "Unknown Cert Type"
+            result['domains'] = ["Unknown Cert Type"]
+
+    except Exception as e:
+        _LOGGER.warning(f"Failed to describe certificate {cert_arn} in region {required_region}: {e}")
+        result['error'] = f"API Error: {type(e).__name__}"
+        result['domains'] = [result['error']] # Put error in domain field if lookup fails
+
+    cert_details_cache[cert_arn] = result
+    return result
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    _LOGGER.info("Starting Certificate Expiry Check script...")
+
+    # --- Config Checks ---
+    if not TARGET_PROFILES:
+        _LOGGER.warning("TARGET_PROFILES list is empty. No accounts to process.")
+        exit(0)
+
+    # --- Filename and Writer ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"{timestamp}_certificate_expiry_check.xlsx"
+    if OUTPUT_DIR:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_filename = os.path.join(OUTPUT_DIR, output_filename)
+    _LOGGER.info(f"Output file will be: {output_filename}")
+    try:
+        writer = pd.ExcelWriter(output_filename, engine='xlsxwriter')
+        workbook = writer.book
+        # Define formats for conditional formatting
+        red_date_format = workbook.add_format({
+            'num_format': EXCEL_DATE_FORMAT, 'align': 'left',
+            'bg_color': '#FFC7CE', 'font_color': '#9C0006'
+        })
+        green_date_format = workbook.add_format({
+            'num_format': EXCEL_DATE_FORMAT, 'align': 'left',
+            'bg_color': '#C6EFCE', 'font_color': '#006100'
+        })
+        default_date_format = workbook.add_format({
+             'num_format': EXCEL_DATE_FORMAT, 'align': 'left'
+        })
+        _LOGGER.info("Excel writer and formats initialized.")
+    except Exception as e:
+        _LOGGER.error(f"Failed to initialize Excel writer: {e}")
+        _LOGGER.error(traceback.format_exc())
+        exit(1)
+
+    # --- CHANGE: Use a single list for all data ---
+    all_cert_data_for_excel = []
+
+    # --- Process Each Profile ---
+    for profile_name in TARGET_PROFILES:
+        _LOGGER.info(f"--- Processing profile: {profile_name} ---")
+        account_alias = profile_name
+        account_id = "Unknown"
+        session_region = None
+        session = None
+        # profile_cert_data removed - use global list
+
+        try:
+            # --- Create Session ---
+            _LOGGER.debug(f"Creating boto3 session for profile: {profile_name}")
+            try:
+                session = boto3.Session(profile_name=profile_name)
+                session_region = session.region_name
+                if not session_region:
+                    raise ValueError(f"Region not found for profile '{profile_name}'.")
+                _LOGGER.info(f"Session created for profile '{profile_name}' using region: {session_region}")
+            except Exception as e:
+                 _LOGGER.error(f"Failed to establish session for profile '{profile_name}'. Skipping. Error: {e}")
+                 continue
+
+            # --- Get Account ID & Alias ---
+            try:
+                sts_client = get_cached_client('sts', session, session_region)
+                if not sts_client: raise Exception("Failed to create STS client")
+                caller_identity = sts_client.get_caller_identity()
+                account_id = caller_identity['Account']
+                _LOGGER.info(f"Processing Account ID: {account_id}")
+                iam_client = get_cached_client('iam', session, 'us-east-1')
+                if not iam_client: raise Exception("Failed to create IAM client")
+                response = iam_client.list_account_aliases()
+                aliases = response.get('AccountAliases', [])
+                account_alias = aliases[0] if aliases else account_id
+                _LOGGER.info(f"Account Name/Alias: {account_alias}")
+            except Exception as e:
+                _LOGGER.error(f"Failed get account info for profile '{profile_name}'. Skipping. Error: {e}")
+                continue
+
+            # --- Collect Cert Usages ---
+            cert_usages = []
+            # (Keep ELBv2, ELB, CloudFront discovery logic exactly as before)
+            _LOGGER.info(f"Checking ELBv2 Load Balancers in {session_region}...")
+            elbv2_client = get_cached_client('elbv2', session, session_region)
+            if elbv2_client:
+                try:
+                    paginator_lb = elbv2_client.get_paginator('describe_load_balancers')
+                    lb_pages = paginator_lb.paginate()
+                    for page in lb_pages:
+                        for lb in page.get('LoadBalancers', []):
+                            lb_arn = lb.get('LoadBalancerArn'); lb_name = lb.get('LoadBalancerName')
+                            _LOGGER.debug(f"Checking listeners for ELBv2 LB: {lb_name} ({lb_arn})")
+                            try:
+                                paginator_li = elbv2_client.get_paginator('describe_listeners')
+                                li_pages = paginator_li.paginate(LoadBalancerArn=lb_arn)
+                                for li_page in li_pages:
+                                    for listener in li_page.get('Listeners', []):
+                                        listener_arn = listener.get('ListenerArn')
+                                        if listener.get('Protocol') in ['HTTPS', 'TLS']:
+                                            for cert in listener.get('Certificates', []):
+                                                cert_arn = cert.get('CertificateArn')
+                                                if cert_arn:
+                                                    cert_region_needed = session_region
+                                                    if cert_arn.startswith('arn:aws:iam:'): cert_region_needed = 'us-east-1'
+                                                    cert_usages.append(('ELBv2', session_region, lb_name or lb_arn, listener_arn, cert_arn, cert_region_needed))
+                            except Exception as e: _LOGGER.warning(f"Could not describe listeners for LB {lb_arn}: {e}")
+                except Exception as e: _LOGGER.error(f"Failed to describe ELBv2 LBs: {e}")
+            else: _LOGGER.warning(f"Skipping ELBv2 checks in {session_region}")
+
+            _LOGGER.info(f"Checking Classic Load Balancers in {session_region}...")
+            elb_client = get_cached_client('elb', session, session_region)
+            if elb_client:
+                try:
+                    paginator_elb = elb_client.get_paginator('describe_load_balancers')
+                    elb_pages = paginator_elb.paginate()
+                    for page in elb_pages:
+                        for lb in page.get('LoadBalancerDescriptions', []):
+                            lb_name = lb.get('LoadBalancerName')
+                            _LOGGER.debug(f"Checking listeners for Classic LB: {lb_name}")
+                            for listener_desc in lb.get('ListenerDescriptions', []):
+                                listener = listener_desc.get('Listener')
+                                if listener and listener.get('Protocol') in ['HTTPS', 'SSL']:
+                                    cert_arn = listener.get('SSLCertificateId')
+                                    if cert_arn:
+                                         cert_region_needed = session_region
+                                         if cert_arn.startswith('arn:aws:iam:'): cert_region_needed = 'us-east-1'
+                                         cert_usages.append(('ELB', session_region, lb_name, f"Port_{listener.get('LoadBalancerPort')}", cert_arn, cert_region_needed))
+                except Exception as e: _LOGGER.error(f"Failed to describe Classic LBs: {e}")
+            else: _LOGGER.warning(f"Skipping Classic ELB checks in {session_region}")
+
+            _LOGGER.info("Checking CloudFront Distributions...")
+            cf_client = get_cached_client('cloudfront', session, 'us-east-1')
+            if cf_client:
+                try:
+                    paginator_cf = cf_client.get_paginator('list_distributions')
+                    cf_pages = paginator_cf.paginate()
+                    for page in cf_pages:
+                        for item in page.get('DistributionList', {}).get('Items', []):
+                            dist_id = item.get('Id'); dist_arn = item.get('ARN')
+                            _LOGGER.debug(f"Checking config for CloudFront distribution: {dist_id}")
+                            try:
+                                config_response = cf_client.get_distribution_config(Id=dist_id)
+                                viewer_cert = config_response.get('DistributionConfig', {}).get('ViewerCertificate', {})
+                                cert_arn = None; cert_region_needed = 'us-east-1'
+                                if viewer_cert.get('ACMCertificateArn'): cert_arn = viewer_cert['ACMCertificateArn']
+                                elif viewer_cert.get('IAMCertificateId'): cert_arn = viewer_cert['IAMCertificateId']
+                                if cert_arn: cert_usages.append(('CloudFront', 'Global', dist_id or dist_arn, 'ViewerCertificate', cert_arn, cert_region_needed))
+                            except Exception as e: _LOGGER.warning(f"Could not get config for CloudFront distribution {dist_id}: {e}")
+                except Exception as e: _LOGGER.error(f"Failed to list CloudFront distributions: {e}")
+            else: _LOGGER.warning(f"Skipping CloudFront checks")
+
+
+            # --- Process Found Certificates ---
+            _LOGGER.info(f"Processing {len(cert_usages)} certificate usages found...")
+            now = datetime.now(timezone.utc)
+            threshold_date = now + timedelta(days=EXPIRY_THRESHOLD_DAYS)
+
+            for usage in cert_usages:
+                service, region, resource_id, usage_context, cert_arn, cert_region_needed = usage
+                # --- CHANGE: Use new function name ---
+                cert_details = get_cert_expiry_and_domains(cert_arn, cert_region_needed, session)
+
+                expiry_date_aware = cert_details.get('expiry') # Aware
+                error_msg = cert_details.get('error')
+                # --- CHANGE: Get domains ---
+                domains_list = cert_details.get('domains', [])
+                domains_str = '; '.join(domains_list) if domains_list else "Not Found/Applicable"
+                if error_msg and not domains_list: # If there was an error getting details, reflect that
+                     domains_str = error_msg
+
+                status = "Error"
+                final_expiry_value_for_excel = error_msg or "Expiry Not Found"
+
+                if expiry_date_aware and isinstance(expiry_date_aware, datetime):
+                    if expiry_date_aware < now: status = "Expired"
+                    elif expiry_date_aware < threshold_date: status = "Expires Soon"
+                    else: status = "OK"
+                    final_expiry_value_for_excel = expiry_date_aware.replace(tzinfo=None) # Naive date
+
+                # --- CHANGE: Append to global list and add domains ---
+                all_cert_data_for_excel.append({
+                    'Account Number': account_id,
+                    'Account Name': account_alias,
+                    'Region': region,
+                    'Service': service,
+                    'Resource Name/ID': resource_id,
+                    'Listener/Behavior': usage_context,
+                    'Certificate ARN': cert_arn,
+                    'Certificate Domains': domains_str, # Added column
+                    'Certificate Expiry Date': final_expiry_value_for_excel, # Naive date or string
+                    'Status': status
+                })
+
+            # --- REMOVED sheet writing from inside the loop ---
+
+        except Exception as e:
+            _LOGGER.error(f"An unexpected error occurred processing profile {profile_name} (Account: {account_id}, Region: {session_region}): {e}")
+            _LOGGER.error(traceback.format_exc())
+            # Continue to the next profile
+
+    # --- Create DataFrame and Write to Excel (Moved outside loop) ---
+    if all_cert_data_for_excel:
+        try:
+            _LOGGER.info(f"Creating final DataFrame with {len(all_cert_data_for_excel)} total certificate usages...")
+            df = pd.DataFrame(all_cert_data_for_excel)
+            # Reindex to ensure column order and presence, handle potential missing columns
+            df = df.reindex(columns=COLUMN_ORDER)
+
+            # --- CHANGE: Use a fixed sheet name ---
+            sheet_name = 'Certificate_Inventory'
+            _LOGGER.info(f"Writing DataFrame to sheet '{sheet_name}'...")
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            # --- Apply Conditional Formatting to the single sheet ---
+            worksheet = writer.sheets[sheet_name]
+            date_col_idx = -1
+            status_col_idx = -1
+            # Find column indexes based on COLUMN_ORDER
+            try:
+                 date_col_idx = COLUMN_ORDER.index('Certificate Expiry Date')
+                 status_col_idx = COLUMN_ORDER.index('Status')
+            except ValueError:
+                 _LOGGER.error("Could not find 'Certificate Expiry Date' or 'Status' column index for formatting.")
+
+            if date_col_idx != -1 and status_col_idx != -1:
+                 _LOGGER.debug(f"Applying conditional formatting to sheet {sheet_name}...")
+                 # Apply formats row by row based on status
+                 for row_idx in range(len(df)):
+                      excel_row = row_idx + 1 # Excel row number
+                      status_val = df.iloc[row_idx, status_col_idx]
+                      date_val_naive = df.iloc[row_idx, date_col_idx]
+
+                      if pd.notna(date_val_naive) and isinstance(date_val_naive, datetime):
+                           cell_format_to_apply = default_date_format # Default
+                           if status_val == "Expired" or status_val == "Expires Soon":
+                                cell_format_to_apply = red_date_format
+                           elif status_val == "OK":
+                                cell_format_to_apply = green_date_format
+                           # Write the naive date value again using the chosen format
+                           worksheet.write_datetime(excel_row, date_col_idx, date_val_naive, cell_format_to_apply)
+                      # else: Error messages/strings remain as written
+
+            # Autofit columns
+            for idx, col_name in enumerate(df.columns):
+                series = df[col_name]
+                # --- CHANGE: Handle potential NaNs in max length calculation ---
+                try:
+                     calculated_len = series.astype(str).map(len).max() if series.notna().any() else 0
+                except Exception: # Catch errors if conversion fails
+                     calculated_len = 0
+                max_len = max((calculated_len, len(str(col_name)))) + 1
+
+                # Specific overrides
+                if col_name == 'Certificate Expiry Date': max_len = 21
+                elif col_name == 'Certificate ARN': max_len = max(max_len, 50)
+                elif col_name == 'Certificate Domains': max_len = max(max_len, 40) # New column width
+                elif col_name == 'Resource Name/ID': max_len = max(max_len, 35)
+                elif col_name == 'Listener/Behavior': max_len = max(max_len, 35)
+                worksheet.set_column(idx, idx, max_len)
+
+        except Exception as e:
+            _LOGGER.error(f"Failed to create or write DataFrame to Excel: {e}")
+            _LOGGER.error(traceback.format_exc())
+    else:
+        _LOGGER.warning("No certificate usage data collected from any profile. Excel file may be empty.")
+        try:
+             # Still create file with headers if nothing was collected
+             df_empty = pd.DataFrame(columns=COLUMN_ORDER)
+             df_empty.to_excel(writer, sheet_name='Certificate_Inventory', index=False)
+        except Exception as e:
+             _LOGGER.error(f"Failed to write empty sheet: {e}")
+
+
+    # --- Save Excel File ---
+    try:
+        _LOGGER.info("Saving Excel file...")
+        # No need to check writer.sheets if we always try to write at least headers
+        writer.close()
+        _LOGGER.info(f"Successfully saved Certificate Expiry Check to {output_filename}")
+    except Exception as e:
+        _LOGGER.error(f"Failed to save Excel file {output_filename}: {e}")
+        _LOGGER.error(traceback.format_exc())
+
+    _LOGGER.info("Certificate Expiry Check script finished.")
