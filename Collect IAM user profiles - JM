@@ -1,0 +1,332 @@
+import boto3
+import pandas as pd
+import os
+import logging
+import traceback
+import re
+from datetime import datetime, timezone
+import botocore # For specific error handling
+
+# --- Configuration ---
+
+# Required: List of AWS CLI Profile names corresponding to target accounts
+TARGET_PROFILES = [
+    "doi-gpsi",
+    "doi-trimble-prod-com",
+    "imagery-data-management",
+    "nhd-plus",
+    "doi-keycloak-prod-com-1",
+    "doi-keycloak-prod-com-2",
+    "doi-osmre",
+    "boem-odgip-prod-com",
+    "fws-iris-mgmt-com",
+    "fws-iris-prod-com",
+    "fws-ecosphere-sandbox-com",
+    "fws-ecosphere-common",
+    "fws-ecosphere-dev",
+    "fws-ecosphere-prod-com",
+    "fws-ecosphere-test",
+    "usgs-wim-wma",
+    "gomcollab",
+    "usgs-wim-prod",
+    "usgs-wim-fws-cbrs",
+    "usgs-wim-main",
+    "usgs-wim-streamstats",
+    "usgs-wim-fws-wetlands",
+    "osmre-eamlis-prod-com",
+    "usgs-shira-prod-com",
+    "fws-tracs-prod",
+    "bor-mp-gis",
+    "doi-datainventory-dev-com",
+    "fema-disasters-prod",
+    "fema-disasters-sandbox",
+    "fema-rmd-prod",
+    "fema-rmd-1",
+    "fema-rmd-2",
+    "bia-bogs-prod-com",
+    "nps-doi-1",
+    "nps-doi-2",
+    "nps-mapbox-prod-com",
+    "nps-mapbox-dev-com",
+    "nps-cartos-prod-com",
+    "nps-cartos-dev-com",
+    "nps-usmp-prod-com",
+    "oas-safecom-staging",
+    "doi-usdaiipp-prod-com",
+    "usgs-trails-dev",
+    "usgs-trails-prod",
+    "doi-borgis-prod-com",
+    "doi-ocio-ac-prod-com",
+    # Add all other profiles you want to potentially connect with
+] # CHANGE_ME
+
+
+# Optional: Specify an output directory for the Excel file
+OUTPUT_DIR = r"" # Example, adjust if needed
+
+# Optional: Customize logging level
+LOG_LEVEL = logging.INFO
+
+# --- Constants ---
+MAX_SHEET_NAME_LENGTH = 30
+# --- CHANGE: Added 'User Status' column ---
+COLUMN_ORDER = [
+    'Account Number',
+    'Account Name',
+    'User Name',
+    'User ARN',
+    'User ID',
+    'Create Date',
+    'Password Last Used',
+    'User Status', # New - Based on policy check
+    'Console Access',
+    'Access Key Active'
+]
+EXCEL_DATE_FORMAT = 'yyyy-mm-dd hh:mm:ss' # For Excel formatting
+
+# --- Logging Setup ---
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(LOG_LEVEL)
+log_handler = logging.StreamHandler()
+log_formatter = logging.Formatter('%(levelname)s:%(asctime)s:%(name)s:%(message)s')
+log_handler.setFormatter(log_formatter)
+if not _LOGGER.hasHandlers():
+    _LOGGER.addHandler(log_handler)
+
+# --- Helper Functions ---
+def sanitize_sheet_name(sheet_name):
+    """Creates a valid Excel sheet name."""
+    if not sheet_name: return "Unnamed_Account"
+    sanitized = re.sub(r'[\\/*?\[\]:]', '_', sheet_name)
+    return sanitized[:MAX_SHEET_NAME_LENGTH]
+
+# --- Cache for boto3 clients { (profile, region, service) : client } ---
+client_cache = {}
+
+def get_cached_client(service, session, region_name):
+    """Gets or creates a boto3 client using a cache."""
+    profile_name = session.profile_name
+    cache_key = (profile_name, region_name, service)
+    if cache_key not in client_cache:
+         _LOGGER.debug(f"Creating new client for {service} in {region_name} for profile {profile_name}")
+         try:
+              if service == 'iam': client_args = {'region_name': 'us-east-1'} # Use us-east-1 for IAM consistency
+              elif service == 'sts' and not region_name: client_args = {'region_name': 'us-east-1'}
+              else: client_args = {'region_name': region_name} if region_name else {}
+              client_cache[cache_key] = session.client(service, **client_args)
+         except Exception as e:
+              _LOGGER.error(f"Failed client creation for {service} in {region_name} profile {profile_name}: {e}")
+              client_cache[cache_key] = None
+    return client_cache[cache_key]
+
+def format_datetime_for_excel(dt_object):
+     """Converts aware datetime to naive UTC for Excel."""
+     if dt_object and isinstance(dt_object, datetime):
+          if dt_object.tzinfo: return dt_object.astimezone(timezone.utc).replace(tzinfo=None)
+          else: return dt_object
+     return None
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    _LOGGER.info("Starting IAM User List export script...")
+
+    # --- Config Checks ---
+    if not TARGET_PROFILES:
+        _LOGGER.error("TARGET_PROFILES list is empty. Exiting.")
+        exit(1)
+
+    # --- Create Filename & Initialize Writer ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"{timestamp}_iam_user_inventory.xlsx"
+    if OUTPUT_DIR:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_filename = os.path.join(OUTPUT_DIR, output_filename)
+    _LOGGER.info(f"Output file will be: {output_filename}")
+    try:
+        writer = pd.ExcelWriter(output_filename, engine='xlsxwriter')
+        workbook = writer.book
+        date_format = workbook.add_format({'num_format': EXCEL_DATE_FORMAT, 'align': 'left'})
+        _LOGGER.info("Excel writer initialized.")
+    except Exception as e:
+        _LOGGER.error(f"Failed to initialize Excel writer: {e}")
+        _LOGGER.error(traceback.format_exc())
+        exit(1)
+
+    # --- Process Each Profile ---
+    for profile_name in TARGET_PROFILES:
+        _LOGGER.info(f"--- Processing profile: {profile_name} ---")
+        account_alias = profile_name; account_id = "Unknown"; session_region = None
+        session = None; iam_client = None; profile_user_data = []
+
+        try:
+            # --- Create Session & Get Basic Info ---
+            _LOGGER.debug(f"Creating boto3 session for profile: {profile_name}")
+            try:
+                session = boto3.Session(profile_name=profile_name)
+                session_region = session.region_name
+                if not session_region:
+                     _LOGGER.warning(f"Default Region not found for profile '{profile_name}'. Using 'us-east-1'.")
+                     session_region = 'us-east-1'
+                _LOGGER.info(f"Session for '{profile_name}' created.")
+            except Exception as e: _LOGGER.error(f"Failed session creation: {e}"); continue
+
+            iam_client = get_cached_client('iam', session, None)
+            if not iam_client: _LOGGER.error(f"Failed IAM client. Skipping."); continue
+
+            try:
+                sts_client = get_cached_client('sts', session, session_region)
+                if not sts_client: raise Exception("Failed STS client")
+                account_id = sts_client.get_caller_identity()['Account']
+                _LOGGER.info(f"Processing Account ID: {account_id}")
+                aliases = iam_client.list_account_aliases().get('AccountAliases', [])
+                account_alias = aliases[0] if aliases else account_id
+                _LOGGER.info(f"Account Name/Alias: {account_alias}")
+            except Exception as e: _LOGGER.error(f"Account info error: {e}"); continue
+
+            # --- List IAM Users and Check Details ---
+            _LOGGER.info(f"Fetching IAM users for {account_alias} ({account_id})...")
+            try:
+                paginator = iam_client.get_paginator('list_users')
+                user_pages = paginator.paginate()
+                user_count = 0
+                users_processed = 0
+
+                for page in user_pages:
+                    for user in page.get('Users', []):
+                        users_processed += 1
+                        user_name = user.get('UserName')
+                        _LOGGER.debug(f"Processing user {users_processed}: {user_name}")
+
+                        # --- Check User Status (Based on Policies) ---
+                        user_status = "Disabled (No Policies)" # Default assumption
+                        try:
+                            # Check attached managed policies
+                            managed_policies = iam_client.list_attached_user_policies(UserName=user_name)
+                            if managed_policies.get('AttachedPolicies'):
+                                user_status = "Enabled (Has Policies)"
+                                _LOGGER.debug(f"User {user_name} has attached managed policies.")
+                            else:
+                                # If no managed policies, check inline policies
+                                inline_policies = iam_client.list_user_policies(UserName=user_name)
+                                if inline_policies.get('PolicyNames'):
+                                    user_status = "Enabled (Has Policies)"
+                                    _LOGGER.debug(f"User {user_name} has inline policies.")
+                                else:
+                                    _LOGGER.debug(f"User {user_name} has no attached or inline policies.")
+                        except Exception as policy_e:
+                            _LOGGER.warning(f"Could not check policies for user {user_name}: {policy_e}")
+                            user_status = "Error Checking Policies"
+
+                        # --- Check Console Access ---
+                        has_console_access = "No"
+                        try:
+                            iam_client.get_login_profile(UserName=user_name)
+                            has_console_access = "Yes"
+                            _LOGGER.debug(f"User {user_name} has Console Access.")
+                        except iam_client.exceptions.NoSuchEntityException:
+                            _LOGGER.debug(f"User {user_name} does not have Console Access.")
+                        except Exception as login_e:
+                            _LOGGER.warning(f"Could not check login profile for user {user_name}: {login_e}")
+                            has_console_access = "Error Checking"
+
+                        # --- Check Active Access Keys ---
+                        has_active_key = "No"
+                        try:
+                            key_paginator = iam_client.get_paginator('list_access_keys')
+                            key_pages = key_paginator.paginate(UserName=user_name)
+                            for key_page in key_pages:
+                                for key_meta in key_page.get('AccessKeyMetadata', []):
+                                    if key_meta.get('Status') == 'Active':
+                                        has_active_key = "Yes"
+                                        _LOGGER.debug(f"User {user_name} has an Active Access Key.")
+                                        break
+                                if has_active_key == "Yes": break
+                            if has_active_key == "No": _LOGGER.debug(f"User {user_name} has no Active Access Keys.")
+                        except Exception as key_e:
+                            _LOGGER.warning(f"Could not list access keys for user {user_name}: {key_e}")
+                            has_active_key = "Error Checking"
+
+                        # Format dates
+                        create_date_naive = format_datetime_for_excel(user.get('CreateDate'))
+                        password_last_used_naive = format_datetime_for_excel(user.get('PasswordLastUsed'))
+
+                        profile_user_data.append({
+                            'Account Number': account_id,
+                            'Account Name': account_alias,
+                            'User Name': user_name,
+                            'User ARN': user.get('Arn'),
+                            'User ID': user.get('UserId'),
+                            'Create Date': create_date_naive,
+                            'Password Last Used': password_last_used_naive,
+                            'User Status': user_status,           # Added
+                            'Console Access': has_console_access,
+                            'Access Key Active': has_active_key
+                        })
+                        user_count += 1
+
+                _LOGGER.info(f"Processed details for {user_count} IAM users for profile {profile_name}.")
+
+            except Exception as e:
+                _LOGGER.error(f"Failed during IAM user listing/processing for profile {profile_name}. Skipping sheet. Error: {e}")
+                continue
+
+            # --- Write this profile's data to Excel sheet ---
+            if profile_user_data:
+                try:
+                    _LOGGER.info(f"Creating DataFrame for account {account_alias} ({account_id})...")
+                    df = pd.DataFrame(profile_user_data)
+                    df = df.reindex(columns=COLUMN_ORDER) # Use updated order
+
+                    sheet_name = sanitize_sheet_name(account_alias)
+                    _LOGGER.info(f"Writing {len(profile_user_data)} users to sheet: {sheet_name}")
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                    # Apply formatting and autofit columns
+                    worksheet = writer.sheets[sheet_name]
+                    for idx, col_name in enumerate(df.columns):
+                        series = df[col_name]
+                        try: calculated_len = series.astype(str).map(len).max() if series.notna().any() else 0
+                        except Exception: calculated_len = 0
+                        max_len = max((calculated_len, len(str(col_name)))) + 2
+
+                        if col_name in ['Create Date', 'Password Last Used']:
+                             worksheet.set_column(idx, idx, 21, date_format)
+                        else:
+                             if col_name == 'User ARN': max_len = max(max_len, 55)
+                             elif col_name == 'Account Name': max_len = max(max_len, 25)
+                             elif col_name == 'User ID': max_len = max(max_len, 24)
+                             # Adjust width for new columns if needed
+                             elif col_name == 'User Status': max_len = max(max_len, 25) # New
+                             elif col_name == 'Console Access': max_len = max(max_len, 16)
+                             elif col_name == 'Access Key Active': max_len = max(max_len, 18)
+                             worksheet.set_column(idx, idx, max_len)
+
+                except Exception as e:
+                    _LOGGER.error(f"Failed to write data to Excel sheet '{sheet_name}': {e}")
+                    _LOGGER.error(traceback.format_exc())
+            else:
+                 _LOGGER.info(f"No IAM user data collected for profile {profile_name}. Skipping sheet.")
+
+
+        except Exception as e:
+            _LOGGER.error(f"Top-level error processing profile {profile_name} (Account: {account_id}): {e}")
+            _LOGGER.error(traceback.format_exc())
+
+    # --- Save Excel File ---
+    try:
+        _LOGGER.info("Saving Excel file...")
+        if writer.sheets:
+             writer.close()
+             _LOGGER.info(f"Successfully saved IAM User inventory to {output_filename}")
+        else:
+             _LOGGER.warning("No data written to Excel file. File not saved.")
+             if os.path.exists(output_filename):
+                  try: writer.close(); os.remove(output_filename)
+                  except: pass
+                  _LOGGER.info(f"Removed empty Excel file: {output_filename}")
+    except Exception as e:
+        _LOGGER.error(f"Failed to save Excel file {output_filename}: {e}")
+        _LOGGER.error(traceback.format_exc())
+
+    _LOGGER.info("IAM User List export script finished.")
+
