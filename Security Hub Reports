@@ -91,6 +91,38 @@ def get_enabled_regions_for_securityhub(session):
         _LOGGER.error(f"Error retrieving enabled regions: {e}")
         return [DEFAULT_REGION]
 
+def is_resource_running(session, region, resource):
+    resource_type = resource.get('Type')
+    resource_id = resource.get('Id')
+
+    try:
+        if resource_type == 'AwsEc2Instance':
+            ec2 = session.client('ec2', region_name=region)
+            instance_id = resource_id.split('/')[-1]
+            response = ec2.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)
+            for status in response['InstanceStatuses']:
+                if status['InstanceState']['Name'] == 'running':
+                    return True
+            return False
+
+        elif resource_type == 'AwsLambdaFunction':
+            lambda_client = session.client('lambda', region_name=region)
+            function_name = resource_id.split(':')[-1]
+            lambda_client.get_function(FunctionName=function_name)
+            return True
+
+        elif resource_type == 'AwsRdsDbInstance':
+            rds = session.client('rds', region_name=region)
+            db_instance_id = resource_id.split(':')[-1]
+            response = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+            for db in response['DBInstances']:
+                if db['DBInstanceStatus'] == 'available':
+                    return True
+            return False
+
+    except Exception:
+        return False
+
 if __name__ == "__main__":
     _LOGGER.info("Starting Security Hub multi-region findings export...")
 
@@ -138,6 +170,10 @@ if __name__ == "__main__":
                         if workflow_status != 'NEW':
                             continue
 
+                        resources = finding.get('Resources', [])
+                        if not any(is_resource_running(session, region, r) for r in resources):
+                            continue
+
                         row = {}
                         for col, path in COLUMN_MAPPING.items():
                             if col == 'Types':
@@ -146,7 +182,6 @@ if __name__ == "__main__":
                             elif col == 'Region':
                                 row[col] = region
                             elif col == 'ImpactedResources':
-                                resources = finding.get('Resources', [])
                                 impacted_ids = [res.get('Id') for res in resources if res.get('Id')]
                                 row[col] = ', '.join(impacted_ids)
                             else:
