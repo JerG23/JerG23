@@ -2,4 +2,5 @@ aws ce get-cost-and-usage \
   --time-period Start=2025-04-01,End=2025-04-30 \
   --granularity MONTHLY \
   --metrics "UnblendedCost" \
-  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Simple Storage Service"]}}'
+  --filter '{"Tags":{"Key":"BucketName","Values":["nationaladdressdata"]}}'
+
