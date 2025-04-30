@@ -1,0 +1,45 @@
+import boto3
+import json
+from botocore.exceptions import ClientError
+
+# Specify the bucket name
+bucket_name = "nationaladdressdata"
+
+# List to store results
+report_lines = [f"--- S3 Bucket Audit: {bucket_name} ---\n"]
+
+# Create a boto3 S3 client
+s3 = boto3.client("s3")
+
+# Function to add results to the report
+def add_result(title, result):
+    report_lines.append(f"\n## {title} ##\n{result}\n")
+
+# Safe wrapper to handle exceptions
+def safe_get(func, title):
+    try:
+        result = func()
+        add_result(title, json.dumps(result, indent=2))
+    except ClientError as e:
+        # Handle specific cases where resources might not exist
+        if e.response["Error"]["Code"] in ("NoSuchBucketPolicy", "NoSuchTagSet", "ServerSideEncryptionConfigurationNotFoundError", "NoSuchLifecycleConfiguration", "NoSuchPublicAccessBlockConfiguration"):
+            add_result(title, "Not configured")
+        else:
+            add_result(title, f"Error: {e.response['Error']['Message']}")
+
+# Collect bucket details
+safe_get(lambda: s3.get_bucket_location(Bucket=bucket_name), "Bucket Region")
+safe_get(lambda: s3.get_bucket_tagging(Bucket=bucket_name), "Bucket Tags")
+safe_get(lambda: s3.get_bucket_policy(Bucket=bucket_name), "Bucket Policy")
+safe_get(lambda: s3.get_bucket_acl(Bucket=bucket_name), "Bucket ACL")
+safe_get(lambda: s3.get_bucket_public_access_block(Bucket=bucket_name), "Public Access Block")
+safe_get(lambda: s3.get_bucket_versioning(Bucket=bucket_name), "Versioning")
+safe_get(lambda: s3.get_bucket_encryption(Bucket=bucket_name), "Encryption")
+safe_get(lambda: s3.get_bucket_lifecycle_configuration(Bucket=bucket_name), "Lifecycle Rules")
+safe_get(lambda: s3.get_bucket_logging(Bucket=bucket_name), "Access Logging")
+
+# Output the report to a file
+with open("s3_bucket_audit_report.txt", "w") as f:
+    f.write("\n".join(report_lines))
+
+print("✅ Audit complete. Results saved to s3_bucket_audit_report.txt")
