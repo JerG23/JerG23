@@ -5,11 +5,15 @@ from botocore.exceptions import ClientError
 # Specify the bucket name
 bucket_name = "nationaladdressdata"
 
+# Specify the profile name (AWS account)
+profile_name = "ir-doi-gpsi"  # Replace with your actual AWS CLI profile name
+
 # List to store results
 report_lines = [f"--- S3 Bucket Audit: {bucket_name} ---\n"]
 
-# Create a boto3 S3 client
-s3 = boto3.client("s3")
+# Create a session using the specified profile
+session = boto3.Session(profile_name=profile_name)
+s3 = session.client("s3")
 
 # Function to add results to the report
 def add_result(title, result):
