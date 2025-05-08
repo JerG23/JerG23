@@ -2,9 +2,8 @@ import boto3
 import pandas as pd
 import logging
 import traceback
-import os
 from datetime import datetime
-import re
+import os
 
 # --- Configuration ---
 TARGET_PROFILES = [
@@ -21,104 +20,95 @@ TARGET_PROFILES = [
     "usgs-trails-prod", "doi-borgis-prod-com", "doi-ocio-ac-prod-com"
 ]
 DEFAULT_REGION = "us-east-1"
-LOG_LEVEL = logging.INFO
+OUTPUT_FILENAME = f"ec2_stopped_terminated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
 # --- Logging Setup ---
-logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s: %(asctime)s: %(message)s")
-LOGGER = logging.getLogger()
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
+logger = logging.getLogger(__name__)
 
-# --- U.S. Regions Only ---
-US_REGIONS = [
-    "us-east-1", "us-east-2",
-    "us-west-1", "us-west-2",
-    "us-gov-west-1", "us-gov-east-1",
-    "us-iso-east-1", "us-isob-east-1"
-]
+# --- Helper Functions ---
+def get_us_regions(session):
+    ec2 = session.client("ec2", region_name=DEFAULT_REGION)
+    return [r["RegionName"] for r in ec2.describe_regions(AllRegions=False)["Regions"] if r["RegionName"].startswith("us-")]
 
-def sanitize_sheet_name(name):
-    return re.sub(r'[\\/*?:\[\]]', "_", name)[:31]
+def collect_instance_details(session, region):
+    instances_data = []
+    ec2 = session.client("ec2", region_name=region)
 
-def get_instance_root_volume_size(ec2_client, instance_id):
     try:
-        vols = ec2_client.describe_volumes(Filters=[{
-            'Name': 'attachment.instance-id',
-            'Values': [instance_id]
-        }])['Volumes']
-        for vol in vols:
-            if any(att['Device'] == '/dev/xvda' or att['Device'] == '/dev/sda1' for att in vol['Attachments']):
-                return vol['Size']
-    except Exception:
-        return None
-    return None
+        paginator = ec2.get_paginator("describe_instances")
+        page_iterator = paginator.paginate(
+            Filters=[{
+                'Name': 'instance-state-name',
+                'Values': ['stopped', 'terminated']
+            }]
+        )
 
-def extract_instance_data(instance, region, root_vol_size):
-    tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
-    return {
-        'Instance ID': instance['InstanceId'],
-        'Name': tags.get('Name', ''),
-        'State': instance['State']['Name'],
-        'Instance Type': instance['InstanceType'],
-        'Platform': instance.get('Platform', 'Linux/UNIX'),
-        'Region': region,
-        'Root Volume Size (GiB)': root_vol_size,
-        'Launch Time': instance['LaunchTime']
-    }
+        for page in page_iterator:
+            for reservation in page["Reservations"]:
+                for instance in reservation["Instances"]:
+                    instance_id = instance.get("InstanceId")
+                    state = instance.get("State", {}).get("Name")
+                    instance_type = instance.get("InstanceType")
+                    name = next((tag["Value"] for tag in instance.get("Tags", []) if tag["Key"] == "Name"), "")
+                    platform = instance.get("Platform", "Linux/UNIX")
+                    root_device = instance.get("RootDeviceType", "")
+                    volumes = []
+                    for mapping in instance.get("BlockDeviceMappings", []):
+                        ebs = mapping.get("Ebs", {})
+                        volumes.append(f"{mapping['DeviceName']}:{ebs.get('VolumeId')}:{ebs.get('VolumeSize','?')}GB:{ebs.get('DeleteOnTermination')}")
+                    eip_info = ""
+                    try:
+                        network_interfaces = instance.get("NetworkInterfaces", [])
+                        for ni in network_interfaces:
+                            if "Association" in ni and "PublicIp" in ni["Association"]:
+                                eip_info = ni["Association"]["PublicIp"]
+                    except Exception:
+                        pass
 
-def get_account_alias(session):
-    try:
-        iam = session.client("iam")
-        aliases = iam.list_account_aliases()["AccountAliases"]
-        return aliases[0] if aliases else session.client("sts").get_caller_identity()["Account"]
-    except Exception:
-        return session.client("sts").get_caller_identity()["Account"]
+                    instances_data.append({
+                        "Region": region,
+                        "InstanceId": instance_id,
+                        "Name": name,
+                        "State": state,
+                        "Type": instance_type,
+                        "Platform": platform,
+                        "RootDeviceType": root_device,
+                        "EBSVolumes": ", ".join(volumes),
+                        "ElasticIP": eip_info
+                    })
+    except Exception as e:
+        logger.error(f"Error in region {region}: {e}")
+        logger.debug(traceback.format_exc())
+    return instances_data
 
+# --- Main ---
 if __name__ == "__main__":
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"{timestamp}_stopped_terminated_ec2.xlsx"
-    writer = pd.ExcelWriter(output_file, engine="xlsxwriter")
+    all_instances = []
 
     for profile in TARGET_PROFILES:
-        LOGGER.info(f"Processing profile: {profile}")
+        logger.info(f"Scanning profile: {profile}")
         try:
-            session = boto3.Session(profile_name=profile, region_name=DEFAULT_REGION)
-            account_name = sanitize_sheet_name(get_account_alias(session))
-            all_instances = []
+            session = boto3.Session(profile_name=profile)
+            account_id = session.client("sts").get_caller_identity().get("Account")
+            regions = get_us_regions(session)
 
-            for region in US_REGIONS:
-                try:
-                    ec2 = session.client("ec2", region_name=region)
-                    paginator = ec2.get_paginator('describe_instances')
-                    pages = paginator.paginate(
-                        Filters=[{
-                            'Name': 'instance-state-name',
-                            'Values': ['stopped', 'terminated']
-                        }]
-                    )
-                    for page in pages:
-                        for reservation in page['Reservations']:
-                            for instance in reservation['Instances']:
-                                root_vol_size = get_instance_root_volume_size(ec2, instance['InstanceId'])
-                                instance_data = extract_instance_data(instance, region, root_vol_size)
-                                all_instances.append(instance_data)
-                except Exception as e:
-                    LOGGER.warning(f"Failed in region {region}: {e}")
-
-            if all_instances:
-                df = pd.DataFrame(all_instances)
-                df.sort_values(by=['Region', 'State', 'Launch Time'], inplace=True)
-                sheet_name = account_name
-                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-                LOGGER.info(f"Wrote {len(df)} instances to sheet: {sheet_name}")
-            else:
-                pd.DataFrame(columns=[
-                    'Instance ID', 'Name', 'State', 'Instance Type',
-                    'Platform', 'Region', 'Root Volume Size (GiB)', 'Launch Time'
-                ]).to_excel(writer, sheet_name=account_name[:31], index=False)
-                LOGGER.info(f"No stopped/terminated instances for profile: {profile}")
+            for region in regions:
+                logger.info(f"  - Scanning region: {region}")
+                instance_info = collect_instance_details(session, region)
+                for i in instance_info:
+                    i["AccountId"] = account_id
+                    i["Profile"] = profile
+                all_instances.extend(instance_info)
 
         except Exception as e:
-            LOGGER.error(f"Error processing profile {profile}: {e}")
-            LOGGER.error(traceback.format_exc())
+            logger.error(f"Failed to process profile {profile}: {e}")
+            logger.debug(traceback.format_exc())
 
-    writer.close()
-    LOGGER.info(f"Report saved to: {output_file}")
+    if all_instances:
+        df = pd.DataFrame(all_instances)
+        df.sort_values(by=["AccountId", "Region", "State"], inplace=True)
+        df.to_excel(OUTPUT_FILENAME, index=False)
+        logger.info(f"Report written to: {OUTPUT_FILENAME}")
+    else:
+        logger.info("No stopped or terminated instances found.")
