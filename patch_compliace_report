@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# Regions to scan
+REGIONS=("us-east-1" "us-east-2" "us-west-1" "us-west-2")
+
+# Output file
+OUTPUT_FILE="patch_compliance_report.json"
+TMP_FILE="tmp_patch_data.json"
+> "$OUTPUT_FILE"
+echo "[" >> "$OUTPUT_FILE"
+
+# Track first record for comma placement
+FIRST=true
+
+for REGION in "${REGIONS[@]}"; do
+    echo "Scanning region: $REGION"
+
+    # Get instance IDs that are managed by SSM
+    INSTANCE_IDS=$(aws ssm describe-instance-information \
+        --region "$REGION" \
+        --query "InstanceInformationList[].InstanceId" \
+        --output text)
+
+    for INSTANCE_ID in $INSTANCE_IDS; do
+        echo "Fetching patch state for instance: $INSTANCE_ID"
+
+        aws ssm describe-instance-patch-states \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --output json > "$TMP_FILE"
+
+        # Add comma between records if not the first
+        if [ "$FIRST" = true ]; then
+            FIRST=false
+        else
+            echo "," >> "$OUTPUT_FILE"
+        fi
+
+        # Write instance patch data to final output
+        cat "$TMP_FILE" >> "$OUTPUT_FILE"
+    done
+done
+
+echo "]" >> "$OUTPUT_FILE"
+rm -f "$TMP_FILE"
+
+echo "Patch compliance report saved to: $OUTPUT_FILE"
