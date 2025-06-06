@@ -1,0 +1,160 @@
+import boto3
+import pandas as pd
+import os
+import logging
+import traceback
+import re
+from datetime import datetime
+
+# --- Configuration ---
+TARGET_PROFILES = [
+    "Target-profile"
+]
+OUTPUT_DIR = ""
+LOG_LEVEL = logging.INFO
+
+# --- Constants ---
+TARGET_REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+MAX_SHEET_NAME_LENGTH = 30
+SEVERITY_ORDER = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFORMATIONAL": 5, "UNDEFINED": 6}
+COLUMN_MAPPING = {
+    'Id': 'Id',
+    'Region': 'Region',
+    'SeverityLabel': 'FindingProviderFields.Severity.Label',
+    'WorkflowStatus': 'Workflow.Status',
+    'ComplianceStatus': 'Compliance.Status',
+    'GeneratorId': 'GeneratorId',
+    'AwsAccountId': 'AwsAccountId',
+    'Types': 'Types',
+    'FirstObservedAt': 'FirstObservedAt',
+    'LastObservedAt': 'LastObservedAt',
+    'CreatedAt': 'CreatedAt',
+    'UpdatedAt': 'UpdatedAt',
+    'Title': 'Title',
+    'Description': 'Description',
+    'ImpactedResources': 'ImpactedResources',
+    'RecordState': 'RecordState'
+}
+COLUMN_ORDER = list(COLUMN_MAPPING.keys())
+
+# --- Logging Setup ---
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(LOG_LEVEL)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s:%(name)s:%(message)s'))
+if not _LOGGER.hasHandlers():
+    _LOGGER.addHandler(handler)
+
+def sanitize_sheet_name(name):
+    return re.sub(r'[\\/*?:\[\]]', "_", name)[:MAX_SHEET_NAME_LENGTH]
+
+def get_nested_value(obj, path, default=None):
+    try:
+        for key in path.split('.'):
+            if isinstance(obj, dict):
+                obj = obj.get(key)
+            elif isinstance(obj, list) and key.isdigit():
+                obj = obj[int(key)]
+            else:
+                return default
+            if obj is None:
+                return default
+        return obj
+    except Exception:
+        return default
+
+if __name__ == "__main__":
+    _LOGGER.info("Starting Security Hub regional findings export...")
+
+    if not TARGET_PROFILES:
+        _LOGGER.warning("No profiles specified.")
+        exit()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = os.path.join(OUTPUT_DIR, f"{timestamp}_security_hub_findings.xlsx")
+    if OUTPUT_DIR:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    writer = pd.ExcelWriter(output_filename, engine='xlsxwriter')
+    processed_accounts = 0
+
+    for profile in TARGET_PROFILES:
+        _LOGGER.info(f"Processing profile: {profile}")
+        findings_data = []
+
+        try:
+            session = boto3.Session(profile_name=profile)
+            sts = session.client('sts')
+            account_id = sts.get_caller_identity()['Account']
+
+            try:
+                iam = session.client('iam')
+                aliases = iam.list_account_aliases().get('AccountAliases', [])
+                account_alias = aliases[0] if aliases else account_id
+            except:
+                account_alias = account_id
+
+            for region in TARGET_REGIONS:
+                _LOGGER.info(f"  Fetching findings from region {region}")
+                try:
+                    sh = session.client('securityhub', region_name=region)
+                    paginator = sh.get_paginator('get_findings')
+                    pages = paginator.paginate(
+                        Filters={'RecordState': [{'Value': 'ACTIVE', 'Comparison': 'EQUALS'}]},
+                        PaginationConfig={'PageSize': 100}
+                    )
+
+                    for page in pages:
+                        for finding in page.get('Findings', []):
+                            workflow_status = get_nested_value(finding, 'Workflow.Status')
+                            if workflow_status != 'NEW':
+                                continue
+
+                            row = {}
+                            for col, path in COLUMN_MAPPING.items():
+                                if col == 'Types':
+                                    val = get_nested_value(finding, path, [])
+                                    row[col] = ', '.join(val) if isinstance(val, list) else val
+                                elif col == 'Region':
+                                    row[col] = region
+                                elif col == 'ImpactedResources':
+                                    resources = finding.get('Resources', [])
+                                    impacted_ids = [res.get('Id') for res in resources if res.get('Id')]
+                                    row[col] = ', '.join(impacted_ids)
+                                else:
+                                    row[col] = get_nested_value(finding, path)
+                            findings_data.append(row)
+
+                except sh.exceptions.InvalidAccessException as e:
+                    _LOGGER.warning(f"Security Hub not enabled in {region} for {account_alias}: {str(e)}")
+                except Exception as e:
+                    _LOGGER.warning(f"Error retrieving findings in {region} for {account_alias}: {str(e)}")
+
+            # Write to Excel
+            sheet_name = sanitize_sheet_name(account_alias)
+            if findings_data:
+                df = pd.DataFrame(findings_data)
+                df = df.reindex(columns=COLUMN_ORDER)
+                df['SeverityRank'] = df['SeverityLabel'].map(lambda x: SEVERITY_ORDER.get(str(x).upper(), 99))
+                df.sort_values(by='SeverityRank', inplace=True)
+                df.drop(columns=['SeverityRank'], inplace=True)
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                writer.sheets[sheet_name].autofit()
+                _LOGGER.info(f"Wrote {len(df)} findings to sheet: {sheet_name}")
+                processed_accounts += 1
+            else:
+                _LOGGER.info(f"No NEW findings found for account: {account_alias}")
+                empty_df = pd.DataFrame(columns=COLUMN_ORDER)
+                empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        except Exception as e:
+            _LOGGER.error(f"Failed to process profile {profile}: {e}")
+            _LOGGER.error(traceback.format_exc())
+
+    try:
+        writer.close()
+        _LOGGER.info(f"Saved Excel report: {output_filename}")
+    except Exception as e:
+        _LOGGER.error(f"Failed to save report: {e}")
+
+    _LOGGER.info(f"Processed {processed_accounts} out of {len(TARGET_PROFILES)} profiles.")
