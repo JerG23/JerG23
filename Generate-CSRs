@@ -1,0 +1,73 @@
+# --- Configuration ---
+$openssl = "C:\Program Files\OpenSSL-Win64\bin\openssl.exe"
+$outputDir = "C:\Users\jgray\OneDrive - DOI\Desktop\TRAILS_SSL Files"
+
+$fqdns = @(
+    "trails-dev-ALB-2066209765.us-west-2.elb.amazonaws.com",
+    "trails-stg-ALB-1985500408.us-west-2.elb.amazonaws.com",
+    "arcgis-trails-test-rds-privlink-312de4b76deadbfd.elb.us-west-2.amazonaws.com",
+    "trails-prod-ALB-1963961163.us-west-2.elb.amazonaws.com"
+)
+
+# --- Script Start ---
+New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+foreach ($fqdn in $fqdns) {
+    $safeName = $fqdn -replace '[^a-zA-Z0-9]', '_'
+    $keyPath = Join-Path $outputDir "$safeName.key"
+    $csrPath = Join-Path $outputDir "$safeName.csr"
+
+    # If FQDN <= 64, use as CN directly
+    if ($fqdn.Length -le 64) {
+        Write-Host "`n🔧 Generating CSR for $fqdn (CN within limit)..."
+        & "$openssl" req -new -newkey rsa:2048 -nodes `
+            -keyout $keyPath `
+            -out $csrPath `
+            -subj "/C=US/ST=VA/L=Reston/O=USGS/OU=IT/CN=$fqdn"
+    }
+    else {
+        Write-Host "`n🔧 Generating CSR for $fqdn (CN too long — using SAN + short CN)..."
+
+        # Short CN: Keep last 64 characters from original FQDN
+        $shortCN = $fqdn.Substring($fqdn.Length - 64)
+
+        # Create a temporary OpenSSL config with SAN
+        $cnfPath = Join-Path $outputDir "$safeName.cnf"
+        $config = @"
+[req]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+req_extensions     = req_ext
+distinguished_name = dn
+
+[dn]
+C  = US
+ST = VA
+L  = Reston
+O  = USGS
+OU = IT
+CN = $shortCN
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $fqdn
+"@
+        $config | Set-Content -Encoding ASCII -Path $cnfPath
+
+        # Generate CSR using config
+        & "$openssl" req -new -newkey rsa:2048 -nodes `
+            -keyout $keyPath `
+            -out $csrPath `
+            -config $cnfPath `
+            -extensions req_ext
+    }
+
+    Write-Host "✅ Created:"
+    Write-Host "   Key: $keyPath"
+    Write-Host "   CSR: $csrPath"
+}
+
+Write-Host "`n🎉 All CSRs and keys generated in: $outputDir"
