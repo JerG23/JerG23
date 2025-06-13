@@ -1,0 +1,133 @@
+import boto3
+import pandas as pd
+import os
+import logging
+import traceback
+from datetime import datetime
+from botocore.exceptions import NoCredentialsError, ProfileNotFound
+
+# --- Configuration ---
+TARGET_PROFILES = [
+"fema-disasters-prod",
+    ]
+DEFAULT_REGION = "us-east-1"
+OUTPUT_DIR = ""
+LOG_LEVEL = logging.INFO
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(LOG_LEVEL)
+log_handler = logging.StreamHandler()
+log_formatter = logging.Formatter('%(levelname)s:%(asctime)s:%(name)s:%(message)s')
+log_handler.setFormatter(log_formatter)
+if not _LOGGER.hasHandlers():
+    _LOGGER.addHandler(log_handler)
+
+def get_account_alias(session):
+    try:
+        iam_client = session.client('iam')
+        response = iam_client.list_account_aliases()
+        aliases = response.get('AccountAliases', [])
+        return aliases[0] if aliases else None
+    except Exception:
+        return None
+
+def get_user_data(iam_client, username):
+    try:
+        user = iam_client.get_user(UserName=username)['User']
+        last_login_dt = user.get('PasswordLastUsed')
+        if last_login_dt:
+            last_login = last_login_dt.replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            last_login = 'Never logged in'
+    except Exception:
+        last_login = 'Never logged in'
+
+    try:
+        groups = iam_client.list_groups_for_user(UserName=username)['Groups']
+        group_names = ';'.join([group['GroupName'] for group in groups])
+    except Exception:
+        group_names = ''
+
+    try:
+        iam_client.get_login_profile(UserName=username)
+        console_access = 'Enabled'
+    except Exception:
+        console_access = 'Disabled'
+
+    access_keys = iam_client.list_access_keys(UserName=username)['AccessKeyMetadata']
+    programmatic_access = 'Enabled' if any(k['Status'] == 'Active' for k in access_keys) else 'Disabled'
+    account_status = 'Enabled' if console_access == 'Enabled' or programmatic_access == 'Enabled' else 'Disabled'
+
+    access_key_status = ';'.join([f"{k['AccessKeyId']} ({k['Status']})" for k in access_keys])
+
+    mfa_devices = iam_client.list_mfa_devices(UserName=username)['MFADevices']
+    mfa_enabled = 'Enabled' if mfa_devices else 'Disabled'
+
+    last_activity = 'Never Active'
+    try:
+        if last_login != 'Never logged in':
+            last_activity = last_login
+
+        for k in access_keys:
+            usage = iam_client.get_access_key_last_used(AccessKeyId=k['AccessKeyId'])
+            last_used_date = usage.get('AccessKeyLastUsed', {}).get('LastUsedDate')
+            if last_used_date:
+                last_used_date = last_used_date.replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+                if last_activity == 'Never Active' or last_used_date > last_activity:
+                    last_activity = last_used_date
+    except Exception:
+        pass
+
+    return [username, group_names, last_login, console_access, programmatic_access, account_status, mfa_enabled, last_activity, access_key_status]
+
+if __name__ == "__main__":
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"{timestamp}_iam_users_report.xlsx"
+    if OUTPUT_DIR:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_filename = os.path.join(OUTPUT_DIR, output_filename)
+
+    try:
+        writer = pd.ExcelWriter(output_filename, engine='xlsxwriter')
+    except Exception as e:
+        _LOGGER.error(f"Failed to initialize Excel writer: {e}")
+        exit(1)
+
+    columns = ["Username", "GroupMembership", "LastLogin", "ConsoleAccess", "ProgrammaticAccess", "AccountStatus", "MFAEnabled", "LastActivity", "AccessKeyStatus"]
+
+    for profile in TARGET_PROFILES:
+        try:
+            session = boto3.Session(profile_name=profile, region_name=DEFAULT_REGION)
+            sts_client = session.client('sts')
+            iam_client = session.client('iam')
+
+            account_id = sts_client.get_caller_identity()['Account']
+            alias = get_account_alias(session) or profile
+            users = iam_client.list_users()['Users']
+
+            data = []
+            for user in users:
+                username = user['UserName']
+                user_data = get_user_data(iam_client, username)
+                data.append(user_data)
+
+            df = pd.DataFrame(data, columns=columns)
+            sheet_name = f"{alias[:15]}_{account_id[-4:]}"
+            writer.sheets[sheet_name] = writer.book.add_worksheet(sheet_name)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            _LOGGER.info(f"Wrote data for {profile} ({account_id}) to sheet {sheet_name}")
+
+        except (NoCredentialsError, ProfileNotFound) as cred_err:
+            _LOGGER.warning(f"Skipping profile '{profile}' due to credential error: {cred_err}")
+            continue
+        except Exception as e:
+            _LOGGER.error(f"Error processing profile '{profile}': {e}")
+            _LOGGER.error(traceback.format_exc())
+            continue
+
+    try:
+        writer.close()
+        _LOGGER.info(f"Saved IAM report to {output_filename}")
+    except Exception as e:
+        _LOGGER.error(f"Failed to save Excel file: {e}")
