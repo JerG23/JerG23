@@ -7,17 +7,7 @@ import os
 
 # --- Configuration ---
 TARGET_PROFILES = [
-    "ir-doi-gpsi", "doi-trimble-prod-com", "imagery-data-management", "nhd-plus",
-    "doi-keycloak-prod-com-1", "doi-keycloak-prod-com-2", "ir-doi-osmre", "boem-odgip-prod-com",
-    "fws-iris-mgmt-com", "fws-iris-prod-com", "fws-ecosphere-sandbox-com", "fws-ecosphere-common",
-    "fws-ecosphere-dev", "fws-ecosphere-prod-com", "fws-ecosphere-test", "usgs-wim-wma", "gomcollab",
-    "usgs-wim-prod", "usgs-wim-fws-cbrs", "usgs-wim-main", "usgs-wim-streamstats",
-    "usgs-wim-fws-wetlands", "osmre-eamlis-prod-com", "usgs-shira-prod-com", "fws-tracs-prod",
-    "bor-mp-gis", "doi-datainventory-dev-com", "fema-disasters-prod", "fema-disasters-sandbox",
-    "fema-rmd-prod", "fema-rmd-1", "fema-rmd-2", "bia-bogs-prod-com", "nps-doi-1", "nps-doi-2",
-    "nps-mapbox-prod-com", "nps-mapbox-dev-com", "nps-cartos-prod-com", "nps-cartos-dev-com",
-    "nps-usmp-prod-com", "oas-safecom-staging", "doi-usdaiipp-prod-com", "usgs-trails-dev",
-    "usgs-trails-prod", "doi-borgis-prod-com", "doi-ocio-ac-prod-com"
+
 ]
 DEFAULT_REGION = "us-east-1"
 OUTPUT_FILENAME = f"ec2_stopped_terminated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
