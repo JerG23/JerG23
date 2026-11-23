@@ -6,7 +6,7 @@ from botocore.exceptions import ClientError
 bucket_name = "nationaladdressdata"
 
 # Specify the profile name (AWS account)
-profile_name = "ir-doi-gpsi"  # Replace with your actual AWS CLI profile name
+profile_name = " "  # Replace with your actual AWS CLI profile name
 
 # List to store results
 report_lines = [f"--- S3 Bucket Audit: {bucket_name} ---\n"]
